@@ -1,39 +1,95 @@
-"""META training utilities: metrics, checkpointing, curriculum, scheduling."""
-import torch, torch.nn.functional as F, os, logging, math, time
-import numpy as np
-from typing import Dict, Optional
-from scipy.stats import pearsonr
+"""META training utilities: curriculum with chunk annealing, scheduled sampling,
+warmup cosine scheduler, early stopping, metrics, checkpointing."""
+import logging, time, os
 logger = logging.getLogger(__name__)
+# ── Parameter counting ──
+def count_parameters(model): return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# ── Device transfer ──
+def to_device(batch, device):
+    import torch
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+# ── FIX #3 + #4: Training curriculum with chunk annealing + scheduled sampling ──
+class TrainingCurriculum:
+    """4-phase curriculum per proposal:
+    P1 (1..p1): encoder warm-up, parallel seq + biochem, gamma=0
+    P2 (p1+1..p1+p2): ramp gamma linearly to target
+    P3 (p1+p2+1..p1+p2+p3): AR + pointer, chunk L anneals from N/4 to 1
+    P4 (>p1+p2+p3): fine-tune, L=1, scheduled sampling at sched_sample_ratio"""
+    def __init__(self, p1=20, p2=30, p3=50, gamma_target=0.5, sched_sample_ratio=0.2):
+        self.p1 = p1; self.p2 = p2; self.p3 = p3
+        self.gamma_target = gamma_target; self.sched_sample_ratio = sched_sample_ratio
+    def get_phase(self, epoch):
+        if epoch < self.p1: return 1
+        if epoch < self.p1 + self.p2: return 2
+        if epoch < self.p1 + self.p2 + self.p3: return 3
+        return 4
+    def get_gamma(self, epoch):
+        if epoch < self.p1: return 0.0
+        if epoch < self.p1 + self.p2:
+            frac = (epoch - self.p1) / max(1, self.p2)
+            return self.gamma_target * frac
+        return self.gamma_target
+    def use_ar(self, epoch):
+        return self.get_phase(epoch) >= 3
+    def get_chunk_size(self, epoch, max_len=500):
+        """FIX #3: chunk anneals from max_len//4 to 1 during Phase 3."""
+        phase = self.get_phase(epoch)
+        if phase < 3: return max_len  # parallel decoding
+        if phase == 3:
+            progress = (epoch - self.p1 - self.p2) / max(1, self.p3)
+            start_chunk = max(max_len // 4, 2)
+            chunk = int(start_chunk * (1.0 - progress) + 1.0 * progress)
+            return max(1, chunk)
+        return 1  # phase 4: fully sequential
+    def get_sched_sample_ratio(self, epoch):
+        """FIX #4: scheduled sampling ratio — only active in Phase 4."""
+        if self.get_phase(epoch) >= 4: return self.sched_sample_ratio
+        return 0.0
+    def __repr__(self):
+        return f"Curriculum(P1={self.p1}, P2={self.p2}, P3={self.p3}, gamma={self.gamma_target})"
+# ── Warmup Cosine LR Scheduler ──
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-6):
+        self.opt = optimizer; self.warmup = warmup_steps; self.total = total_steps; self.min_lr = min_lr
+        self.base_lrs = [g['lr'] for g in optimizer.param_groups]; self.step_count = 0
+    def step(self):
+        self.step_count += 1
+        if self.step_count <= self.warmup:
+            frac = self.step_count / max(1, self.warmup)
+        else:
+            progress = (self.step_count - self.warmup) / max(1, self.total - self.warmup)
+            frac = 0.5 * (1.0 + __import__('math').cos(__import__('math').pi * progress))
+        for g, base_lr in zip(self.opt.param_groups, self.base_lrs):
+            g['lr'] = max(self.min_lr, base_lr * frac)
+    def state_dict(self): return {'step_count': self.step_count}
+    def load_state_dict(self, sd): self.step_count = sd['step_count']
+# ── Early Stopping ──
+class EarlyStopping:
+    def __init__(self, patience=10):
+        self.patience = patience; self.counter = 0; self.best = float('inf'); self.should_stop = False
+    def __call__(self, val_loss):
+        if val_loss < self.best: self.best = val_loss; self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience: self.should_stop = True
+        return self.should_stop
+# ── Timer ──
+class Timer:
+    def __init__(self): self.start = time.time()
+    def elapsed(self): return time.time() - self.start
+    def reset(self): self.start = time.time()
 # ── Metrics ──
-def sequence_recovery(logits, targets, mask=None):
-    preds = logits.argmax(-1); correct = preds == targets
-    if mask is not None: correct = correct & mask
-    n = mask.sum().item() if mask is not None else len(targets)
-    return correct.sum().item() / max(n, 1)
-def perplexity(logits, targets, mask=None):
-    lp = torch.nn.functional.log_softmax(logits, -1)
-    nll = torch.nn.functional.nll_loss(lp, targets, reduction='none')
-    if mask is not None: nll = nll * mask.float()
-    avg = nll.sum() / (mask.float().sum()+1e-8) if mask is not None else nll.mean()
-    return torch.exp(avg).item()
-def msf_correlation(pred, target, batch_idx, has_dyn):
-    corrs = []
-    for b in range(has_dyn.shape[0]):
-        if has_dyn[b].item() == 0: continue
-        m = batch_idx == b; p = pred[m].detach().cpu().numpy(); t = target[m].detach().cpu().numpy()
-        if len(p) < 3 or t.std() < 1e-8: continue
-        r, _ = pearsonr(p, t)
-        if not np.isnan(r): corrs.append(r)
-    return float(np.mean(corrs)) if corrs else 0.0
 def compute_all_metrics(pred, batch, use_ar=False):
-    m = {}; seq_mask = batch['seq_idx'] < 20; seq_tgt = batch['seq_idx'].clamp(0, 19)
-    lk = 'ar_logits' if (use_ar and 'ar_logits' in pred) else 'seq_logits'
-    m['recovery'] = sequence_recovery(pred[lk], seq_tgt, seq_mask)
-    m['perplexity'] = perplexity(pred[lk], seq_tgt, seq_mask)
-    if pred['biochem_pred'].shape[0] > 0:
-        m['biochem_mae'] = (pred['biochem_pred'] - batch['biochem_targets']).abs().mean().item()
-    if batch['has_dynamics'].any():
-        m['msf_corr'] = msf_correlation(pred['msf_pred'], batch['msf'], batch['node_batch'], batch['has_dynamics'])
+    import torch; import torch.nn.functional as F
+    m = {}
+    logits = pred['ar_logits'] if (use_ar and 'ar_logits' in pred) else pred['seq_logits']
+    pred_aa = logits.argmax(-1); gt = batch['seq_idx'].clamp(0, 19)
+    valid = batch['seq_idx'] < 20
+    m['recovery'] = ((pred_aa == gt) & valid).float().sum().item() / (valid.float().sum().item() + 1e-8)
+    if 'msf_pred' in pred and batch['msf'].shape[0] > 0:
+        p = pred['msf_pred'].detach(); t = batch['msf']
+        if p.shape[0] == t.shape[0] and t.std() > 1e-6 and p.std() > 1e-6:
+            m['msf_pearson'] = torch.corrcoef(torch.stack([p, t]))[0, 1].item()
     # reconstruction metrics
     if 'recon_preds' in pred:
         total_masked = sum(p.shape[0] for p in pred['recon_preds'])
@@ -43,58 +99,20 @@ def compute_all_metrics(pred, batch, use_ar=False):
     if 'topo_nbr_logits' in pred:
         all_l = torch.cat([l for l in pred['topo_nbr_logits'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_logits',[]) if l.shape[0]>0])
         all_t = torch.cat([l for l in pred['topo_nbr_labels'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_labels',[]) if l.shape[0]>0])
-        if all_l.shape[0] > 0:
-            m['topo_auroc'] = ((all_l > 0).float() == all_t).float().mean().item()  # approx accuracy
+        if all_l.shape[0] > 0: m['topo_acc'] = ((all_l > 0).float() == all_t).float().mean().item()
     return m
 # ── Checkpointing ──
 def save_checkpoint(model, optimizer, scheduler, epoch, step, metrics, path, scaler=None):
+    import torch
     st = {'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'epoch': epoch, 'step': step, 'metrics': metrics}
     if scheduler: st['scheduler_state'] = scheduler.state_dict()
     if scaler: st['scaler_state'] = scaler.state_dict()
     torch.save(st, path); logger.info(f"Saved: {path} (epoch={epoch})")
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+    import torch
     ck = torch.load(path, map_location='cpu', weights_only=False)
     model.load_state_dict(ck['model_state'])
     if optimizer and 'optimizer_state' in ck: optimizer.load_state_dict(ck['optimizer_state'])
     if scheduler and 'scheduler_state' in ck: scheduler.load_state_dict(ck['scheduler_state'])
     if scaler and 'scaler_state' in ck: scaler.load_state_dict(ck['scaler_state'])
     return {'epoch': ck['epoch'], 'step': ck['step'], 'metrics': ck.get('metrics', {})}
-# ── Curriculum ──
-class TrainingCurriculum:
-    def __init__(self, p1=20, p2=30, p3=50, gamma_target=0.5, ss_max=0.2):
-        self.p1e = p1; self.p2e = p1+p2; self.p3e = p1+p2+p3; self.gt = gamma_target; self.ssm = ss_max
-    def get_phase(self, ep):
-        if ep < self.p1e: return 1
-        return 2 if ep < self.p2e else 3
-    def get_gamma(self, ep):
-        p = self.get_phase(ep)
-        if p == 1: return 0.0
-        if p == 2: return self.gt * (ep-self.p1e)/max(1, self.p2e-self.p1e)
-        return self.gt
-    def use_ar(self, ep): return self.get_phase(ep) == 3
-    def __repr__(self): return f"Curriculum(P1=0-{self.p1e}, P2={self.p1e}-{self.p2e}, P3={self.p2e}-{self.p3e})"
-# ── LR Scheduler ──
-class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, opt, warmup, total, min_lr=1e-6, last_epoch=-1):
-        self.ws = warmup; self.ts = total; self.ml = min_lr; super().__init__(opt, last_epoch)
-    def get_lr(self):
-        s = self.last_epoch
-        sc = s/max(1, self.ws) if s < self.ws else 0.5*(1+math.cos(math.pi*(s-self.ws)/max(1, self.ts-self.ws)))
-        return [max(self.ml, lr*sc) for lr in self.base_lrs]
-# ── Early Stopping ──
-class EarlyStopping:
-    def __init__(self, patience=10, min_delta=1e-4):
-        self.p = patience; self.md = min_delta; self.best = None; self.c = 0; self.stop = False
-    def step(self, v):
-        if self.best is None: self.best = v; return False
-        if v < self.best - self.md: self.best = v; self.c = 0
-        else:
-            self.c += 1
-            if self.c >= self.p: self.stop = True
-        return self.stop
-class Timer:
-    def __init__(self): self.t0 = time.time()
-    def total(self): return time.time() - self.t0
-def count_parameters(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
-def to_device(batch, device):
-    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
