@@ -1,0 +1,481 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{mathptmx}
+\usepackage{wrapfig}
+\usepackage{amssymb}
+\usepackage{tocbibind}
+\usepackage{setspace}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage[a4paper, left=3cm, right=2.5cm]{geometry}
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\usepackage{tcolorbox}
+\fancyhf[L]{}
+\renewcommand{\headrulewidth}{0pt}
+\fancyfoot[C]{\thepage}
+\fancyfoot[L]{}
+
+\usepackage{indentfirst}
+
+\title{\textbf{Medoid-to-Ensemble Topological Autoencoding: \\ Generative Inverse Folding for Protein Dynamics via Combinatorial Complexes}}
+\author{Research Proposal}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Computational protein design via inverse folding has been constrained to the static paradigm: a single rigid backbone dictates sequence generation. This assumption ablates the conformational flexibility essential for biological function in allosteric enzymes, molecular hinges, and intrinsically disordered regions. We propose a \textbf{Medoid-to-Ensemble Topological Autoencoder (META)}, a generative framework that bridges static structure and dynamic biophysics. Given any target fold, we first generate a physically grounded conformational ensemble via Anisotropic Network Model (ANM) Normal Mode Analysis using ProDy, extracting the ensemble medoid as a single representative geometry. This static medoid is represented as a cochain complex with explicit 0-cochains (residues), 1-cochains (contacts), 2-cochains (angular bends), and 3-cochains (torsional motifs), and processed through a hybrid attention/convolution bidirectional topological message-passing architecture. The model is trained via a multi-objective loss to simultaneously recover the native amino acid sequence, predict higher-order physicochemical microenvironments, and decode per-residue and pairwise structural fluctuation profiles---all strictly from the static medoid latent space. At inference, sequences are generated via a dynamics-conditioned autoregressive decoder that explicitly conditions each residue's identity on the predicted local flexibility and biochemical context. We provide a rigorous analysis of potential information leakage channels and propose controlled ablations. This framework enables the design of sequences intrinsically tailored to support wild-type flexibility profiles, addressing a fundamental gap in structure-based protein design.
+\end{abstract}
+
+\section{Introduction}
+
+Deep learning models for inverse folding, including ProteinMPNN and ESM-IF, have revolutionized de novo protein design by learning structure-to-sequence mappings with high native sequence recovery rates. However, these models operate under a ``one-structure-to-one-sequence'' assumption: a single, rigid backbone conformation serves as both input and design target. This static paradigm is fundamentally misaligned with the thermodynamic reality of proteins, whose biological function is governed by conformational ensembles, transient states, and dynamic fluctuation profiles.
+
+The consequences of this misalignment are well-documented. When inverse folding models optimized on static crystal structures are applied to proteins with essential flexibility---such as allosteric enzymes, molecular hinges, or intrinsically disordered regions---the resulting sequences often stabilize a single conformational basin at the expense of the functional motions required for catalysis, signaling, or molecular recognition. Concurrently, efforts to evaluate designed sequences using forward-folding models (e.g., AlphaFold2) are limited by the fact that algorithmic confidence metrics ($\Delta$pLDDT) lack the sensitivity to reliably proxy in vitro thermodynamic changes ($\Delta\Delta G$), particularly for mutations that modulate flexibility rather than stability.
+
+To bridge this gap, we introduce the \textbf{Medoid-to-Ensemble Topological Autoencoder (META)}. Our framework makes three principal contributions:
+
+\begin{enumerate}
+    \item \textbf{Physically grounded ensemble generation.} We employ Anisotropic Network Model (ANM) Normal Mode Analysis via ProDy to generate conformational ensembles that are rooted in elastic network theory rather than learned model uncertainty. We explicitly validate these ensembles against experimental B-factors and NMR order parameters.
+    \item \textbf{Hybrid topological message passing on cochain complexes.} We represent proteins as cochain complexes with nodes (residues), edges (contacts), bends (angular motifs), and torsions (dihedral motifs), and process them through a hybrid attention/convolution architecture with configurable layer types. Adjacency and coadjacency within each rank, combined with incidence-based inter-rank communication, enable comprehensive topological information flow.
+    \item \textbf{Dynamics-conditioned autoregressive sequence generation.} Rather than one-shot parallel decoding, we generate sequences autoregressively with a random decoding order, conditioning each residue's amino acid identity on the predicted local dynamicity, biochemical microenvironment, and previously decoded residues.
+\end{enumerate}
+
+\section{Methodology}
+
+\subsection{Conformational Ensemble Generation via Normal Mode Analysis}
+
+\subsubsection{Motivation and Physical Grounding}
+A critical design decision in any dynamics-aware framework is the source of the conformational ensemble. Prior work has employed AlphaFold2 with stochastic dropout in the Structure Module to generate structural diversity. While computationally convenient, such ensembles reflect the \emph{learned uncertainty} of a forward-folding model rather than a Boltzmann-weighted conformational distribution. They systematically overestimate flexibility in well-folded regions and underestimate it in genuinely disordered regions when compared to Molecular Dynamics (MD) or NMR data.
+
+We instead employ \textbf{Anisotropic Network Model (ANM)} Normal Mode Analysis, implemented via the ProDy library. The ANM models the protein as an elastic network of $C_\alpha$ atoms connected by harmonic springs within a distance cutoff $r_c = 15$\AA. The Hessian matrix $\mathbf{H} \in \mathbb{R}^{3N \times 3N}$ of the network encodes the second-order energy landscape around the equilibrium structure. The off-diagonal $3 \times 3$ super-elements are:
+\begin{equation}
+    \mathbf{H}_{ij} = -\gamma \frac{(\mathbf{r}_i - \mathbf{r}_j)(\mathbf{r}_i - \mathbf{r}_j)^\top}{|\mathbf{r}_i - \mathbf{r}_j|^2} \quad \text{for } |\mathbf{r}_i - \mathbf{r}_j| \leq r_c, \quad i \neq j
+\end{equation}
+and the diagonal super-elements are $\mathbf{H}_{ii} = -\sum_{j \neq i} \mathbf{H}_{ij}$, ensuring that $\mathbf{H}$ is positive semi-definite. Here, $\gamma$ is a uniform spring constant and $\mathbf{r}_i \in \mathbb{R}^3$ is the position of the $i$-th $C_\alpha$ atom. Eigendecomposition of $\mathbf{H}$ yields the normal modes $\{\mathbf{u}_m, \lambda_m\}_{m=1}^{3N-6}$, where $\mathbf{u}_m$ are the mode eigenvectors and $\lambda_m$ are the corresponding eigenvalues (squared frequencies). The first six zero-eigenvalue modes correspond to rigid-body translation and rotation and are discarded.
+
+\subsubsection{Ensemble Sampling}
+We generate the conformational ensemble $\mathcal{T} = \{t_1, \ldots, t_M\}$ by superposing thermally weighted displacements along the $K$ lowest-frequency non-trivial modes:
+\begin{equation}
+    \mathbf{r}_i^{(s)} = \mathbf{r}_i^{(0)} + \sum_{m=1}^{K} q_m^{(s)} \, \mathbf{u}_{m,i}, \qquad q_m^{(s)} \sim \mathcal{N}\left(0, \; \frac{k_B T}{\lambda_m}\right)
+\end{equation}
+where $\mathbf{r}_i^{(0)}$ is the equilibrium position, $q_m^{(s)}$ is the sampled amplitude for mode $m$ in sample $s$, $k_B$ is Boltzmann's constant, and $T$ is temperature. We use $K = 20$ modes and generate $M = 1000$ conformers. The computational cost is dominated by the eigendecomposition of $\mathbf{H}$, which scales as $O(N^3)$ for $N$ residues but is trivially parallelizable and requires seconds to minutes per protein, compared to hours or days for MD simulations.
+
+\subsubsection{Medoid Extraction}
+From the ensemble $\mathcal{T}$, we compute the pairwise $C_\alpha$ RMSD matrix $\mathbf{D} \in \mathbb{R}^{M \times M}$ and extract the \textbf{medoid}---the frame $t_{\text{med}} \in \mathcal{T}$ that minimizes the average RMSD to all other frames:
+\begin{equation}
+    t_{\text{med}} = \arg\min_{t_s \in \mathcal{T}} \frac{1}{M} \sum_{s'=1}^{M} \text{RMSD}(t_s, t_{s'})
+\end{equation}
+
+\subsubsection{Experimental Validation Requirement}
+Before training, we validate the ANM ensemble against experimental measures of dynamics. For each protein in the training set with available crystallographic data, we compute the Pearson correlation between the predicted per-residue mean-square fluctuation (MSF) from the ANM:
+\begin{equation}
+    \langle \Delta \mathbf{r}_i^2 \rangle_{\text{ANM}} = \frac{k_B T}{\gamma} \sum_{m=1}^{K} \frac{[\mathbf{u}_{m,i}]^2}{\lambda_m}
+\end{equation}
+and the experimental isotropic B-factor: $B_i = \frac{8\pi^2}{3} \langle \Delta \mathbf{r}_i^2 \rangle$. Proteins with Pearson $\rho < 0.5$ between ANM-predicted and experimental B-factors are flagged for quality control. For proteins with available NMR order parameters ($S^2$), we additionally verify anticorrelation with ANM flexibility. This validation ensures that the dynamicity targets used in training reflect genuine physical motions rather than artifacts of the elastic model.
+
+\subsection{Input Representation: Medoid Combinatorial Complex (MCC)}
+
+\subsubsection{Strict Information Boundary}
+The input to the neural network is derived \textbf{exclusively} from the static medoid structure $t_{\text{med}}$. No temporal information, ensemble variance, mode shapes, eigenvalues, or any quantity derived from the full ensemble $\mathcal{T}$ is included in the input features. The rationale is as follows: the network must learn to \emph{infer} dynamicity from static geometric cues (e.g., loop geometry, packing density, dihedral basin context), rather than trivially regressing from pre-computed variance inputs.
+
+\subsubsection{Data Leakage Analysis}
+We identify and address three potential information leakage channels:
+
+\begin{enumerate}
+    \item \textbf{Medoid selection bias.} The medoid is selected by a procedure that requires knowledge of the full ensemble. Its selection implicitly encodes the ensemble's central tendency (though not its variance). We address this through a controlled ablation (Section~\ref{sec:ablations}) comparing medoid input against: (a) a random ensemble frame, and (b) the input PDB crystal structure without any ensemble generation.
+    
+    \item \textbf{Contact graph topology.} The $C_\beta$ contact graph of the medoid encodes sparsity patterns that correlate with flexibility---highly dynamic regions tend to have fewer stable contacts. We accept this as a legitimate structural signal (analogous to how B-factors correlate with solvent accessibility) but explicitly measure the mutual information between node degree and dynamicity targets to quantify this channel.
+    
+    \item \textbf{Dihedral basin ambiguity.} Backbone dihedrals in flexible regions often sit near Ramachandran basin boundaries in the medoid. We include this as a feature but discuss it as a confound in our analysis, and ablate by replacing continuous dihedrals with discrete secondary structure labels (H/E/C) to assess the contribution of dihedral fine structure to dynamicity prediction.
+\end{enumerate}
+
+\subsubsection{Cochain Complex Construction}
+We adopt the terminology of \emph{cochains} rather than cells, because our message-passing scheme permits information flow beyond the standard boundary/coboundary maps---specifically via adjacency and coadjacency within each rank. The medoid structure is represented as a cochain complex $\mathcal{X} = (\mathcal{C}_0, \mathcal{C}_1, \mathcal{C}_2, \mathcal{C}_3)$ with the following rank definitions and features:
+
+\paragraph{0-cochains ($\mathcal{C}_0$: Residues).} Each residue $i$ is a node with feature vector $\mathbf{f}_i^{(0)}$ comprising:
+\begin{itemize}
+    \item Backbone dihedrals $(\phi_i, \psi_i, \omega_i)$ encoded via sine/cosine pairs $\rightarrow 6$ dimensions.
+    \item Bond angle $\angle(N_i\text{-}C_{\alpha,i}\text{-}C_i)$ encoded via RBF with 16 Gaussian centers $\rightarrow 16$ dimensions.
+    \item Relative solvent-accessible surface area (SASA) from the medoid $\rightarrow 1$ dimension.
+\end{itemize}
+Total: $d_0 = 23$ input features per node, linearly projected to $d_{\text{model}}$. We deliberately exclude discrete secondary structure labels (H/E/C) from DSSP: the network should infer secondary structure context from the continuous backbone dihedrals and local geometry, avoiding a lossy discretization that collapses fine-grained conformational information.
+
+\paragraph{1-cochains ($\mathcal{C}_1$: Contacts).} Edges connect residue pairs $(i, j)$ whose $C_\beta$ pseudo-atoms (virtual $C_\beta$ computed from backbone $N, C_\alpha, C$ for all residues, including glycine) lie within a distance cutoff of $r_{\text{edge}} = 8$\AA\ in the medoid. Edge features $\mathbf{f}_{ij}^{(1)}$ comprise:
+\begin{itemize}
+    \item RBF-encoded $C_\beta$--$C_\beta$ distance with 16 Gaussian centers $\rightarrow 16$ dimensions.
+    \item Unit direction vector $\hat{\mathbf{d}}_{ij} = (\mathbf{r}_j - \mathbf{r}_i) / \|\mathbf{r}_j - \mathbf{r}_i\|$, projected into the local backbone frame of residue $i$ $\rightarrow 3$ dimensions. The convention $\mathbf{r}_j - \mathbf{r}_i$ encodes the direction \emph{from} $i$ \emph{toward} $j$: when residue $i$ aggregates information from neighbour $j$, the direction vector tells $i$ where $j$ is located relative to its own local coordinate system, enabling SE(3)-invariant directional reasoning.
+    \item Sequence separation $|i - j|$ encoded via sinusoidal positional encoding $\rightarrow 16$ dimensions.
+    \item Covalent bond indicator: a 2-dimensional one-hot encoding denoting whether the edge connects sequentially adjacent residues in the same chain (covalent) or not (non-covalent) $\rightarrow 2$ dimensions. This allows the network to distinguish backbone-bonded contacts from through-space contacts.
+\end{itemize}
+Total: $d_1 = 37$ input features per edge.
+
+\paragraph{2-cochains ($\mathcal{C}_2$: Bends).} A bend $(i, j, k)$ is a 2-cochain if and only if edges $(i, j)$ and $(j, k)$ both exist in $\mathcal{C}_1$, with residue $j$ serving as the \textbf{central node}. Unlike closed triangles, the edge $(i, k)$ is \emph{not} required to exist. This definition captures the local angular geometry at each residue: the angle subtended at $j$ by its pair of contacts $(i, j)$ and $(j, k)$. To avoid duplicate bends under relabeling, we enforce the canonical ordering $i < k$. For a node $j$ with degree $\deg(j)$, the number of bends centered at $j$ is $\binom{\deg(j)}{2}$.
+
+The 2-cochain feature is simply the cosine of the bending angle at the central node:
+\begin{equation}
+    \mathbf{f}_{ijk}^{(2)} = \cos\theta_{ijk} = \frac{(\mathbf{r}_i - \mathbf{r}_j) \cdot (\mathbf{r}_k - \mathbf{r}_j)}{\|\mathbf{r}_i - \mathbf{r}_j\| \, \|\mathbf{r}_k - \mathbf{r}_j\|}
+\end{equation}
+Total: $d_2 = 1$ input feature per bend, linearly projected to $d_{\text{model}}$.
+
+\paragraph{3-cochains ($\mathcal{C}_3$: Torsions).} A torsion $(i, j, k, l)$ is a 3-cochain formed when two bends $(i, j, k)$ and $(j, k, l)$ share the common edge $(j, k)$ and are composed of four distinct nodes $i, j, k, l$. This captures the dihedral (torsional) geometry between the two planes defined by $(i, j, k)$ and $(j, k, l)$---analogous to backbone $\phi/\psi$ angles but generalized to the full contact graph. The 3-cochain feature encodes the dihedral angle $\varphi_{ijkl}$ via its sine and cosine:
+\begin{equation}
+    \mathbf{f}_{ijkl}^{(3)} = [\sin\varphi_{ijkl}, \; \cos\varphi_{ijkl}]
+\end{equation}
+where $\varphi_{ijkl}$ is the signed dihedral angle between the two planes, computed via the standard four-point formula. Total: $d_3 = 2$ input features per torsion.
+
+\subsubsection{Neighbourhood Definitions: Adjacency, Coadjacency, and Incidence}
+
+Within each rank, $r$-cochains communicate via two complementary notions of neighbourhood:
+
+\begin{itemize}
+    \item \textbf{Adjacency} ($\mathbf{A}^{(r)}$): Two $r$-cochains are \emph{adjacent} if they share a common $(r{-}1)$-cochain as a face. For rank 0, adjacency is defined by the edge graph ($\mathcal{C}_1$). For rank 1, two edges are adjacent if they share a node. For rank 2, two bends are adjacent if they share an edge. For rank 3, two torsions are adjacent if they share a bend.
+    \item \textbf{Coadjacency} ($\mathbf{CoA}^{(r)}$): Two $r$-cochains are \emph{coadjacent} if they are both faces of a common $(r{+}1)$-cochain. For rank 0, two nodes are coadjacent if both participate in the same edge (equivalent to adjacency). For rank 1, two edges are coadjacent if both participate in the same bend. For rank 2, two bends are coadjacent if both participate in the same torsion. Rank 3 has no coadjacency (no rank~4).
+\end{itemize}
+
+The \textbf{intra-rank neighbourhood} $\mathbf{N}^{(r)}$ used for self-attention or convolution at rank $r$ is the union:
+\begin{equation}
+    \mathbf{N}^{(r)} = \mathbf{A}^{(r)} \cup \mathbf{CoA}^{(r)}
+\end{equation}
+This union ensures that each $r$-cochain can exchange information both with cochains that share a lower-order face (adjacency) and with cochains that co-participate in a higher-order structure (coadjacency).
+
+\textbf{Inter-rank communication} is mediated by incidence matrices. The incidence matrix $\mathbf{I}_{r \to r+1}$ connects rank-$r$ cochains to rank-$(r{+}1)$ cochains: $I_{r \to r+1}[\sigma, \tau] = 1$ iff the $r$-cochain $\tau$ is a face of the $(r{+}1)$-cochain $\sigma$. This defines the coboundary map (upward, $r \to r{+}1$) and its transpose defines the boundary map (downward, $r{+}1 \to r$).
+
+\subsubsection{Implicit Multi-Chain Encoding}
+\label{sec:implicit_multichain}
+
+Multi-chain protein complexes are represented as a single unified cochain complex \emph{without} explicit chain identity labels. The entire complex is processed as one higher-order graph, where chain boundaries are encoded \textbf{implicitly} through the covalent bond indicator in the 1-cochain features: intra-chain sequential neighbours have covalent $= [1, 0]$, while all other edges (both intra-chain non-sequential and inter-chain) have covalent $= [0, 1]$. The model learns to infer chain membership from the topology of covalent bond connectivity---residues connected by a path of covalent edges belong to the same chain.
+
+This design has two key advantages: (1) it naturally enables \textbf{cross-chain bends and torsions}. Since the edge graph spans both chains, the bend and torsion construction algorithm automatically discovers inter-chain angular and dihedral motifs at protein-protein interfaces, capturing the higher-order geometry of binding interfaces without special-casing. (2) It avoids information leakage from explicit chain labels, which would otherwise allow the model to trivially distinguish partner chains rather than learning interface geometry.
+
+\subsection{Hybrid Topological Message Passing: Attention and Convolution}
+
+We process the cochain complex using a hybrid architecture that combines \textbf{sparse attention layers} with \textbf{graph convolutional layers} at each rank $r \in \{0, 1, 2, 3\}$. The key insight is that attention is expressive but computationally expensive, while graph convolution (GCNN) is fast but less expressive. In a multi-layer network, we allow a configurable mix: for example, one attention layer followed by several GCNN layers, substantially reducing cost while preserving representational power.
+
+Let $\mathbf{h}_i^{(r),l} \in \mathbb{R}^{d_{\text{model}}}$ denote the hidden state of cochain $i$ at rank $r$ in layer $l$, with $\mathbf{h}_i^{(r),0}$ initialized by linear projection of $\mathbf{f}_i^{(r)}$.
+
+\subsubsection{Intra-Rank Operations}
+
+Each layer applies either sparse attention or graph convolution within each rank, governed by the neighbourhood $\mathbf{N}^{(r)} = \mathbf{A}^{(r)} \cup \mathbf{CoA}^{(r)}$.
+
+\paragraph{Option A: Neighbourhood-Masked Sparse Attention.} This is the expressive variant, used in one or a few layers. Attention scores are computed only at sparse neighbour positions (not dense $N_r \times N_r$), and grouped softmax is applied via scatter operations:
+\begin{equation}
+    \alpha_{ij}^h = \frac{\exp\left(\frac{\mathbf{q}_i^h \cdot \mathbf{k}_j^h}{\sqrt{d_k}} + b_i^h\right)}{\sum_{j' \in \mathbf{N}^{(r)}(i)} \exp\left(\frac{\mathbf{q}_i^h \cdot \mathbf{k}_{j'}^h}{\sqrt{d_k}} + b_i^h\right)}, \qquad
+    \mathbf{o}_i = \mathbf{W}_O \, \text{Concat}_h\left[\mathbf{g}_i^h \odot \sum_{j \in \mathbf{N}^{(r)}(i)} \alpha_{ij}^h \, \mathbf{v}_j^h\right]
+\end{equation}
+where $b_i^h$ is an input-dependent per-query bias and $\mathbf{g}_i^h = \sigma(\mathbf{W}_g^h \mathbf{h}_i)$ is a per-element gate.
+
+\paragraph{Option B: Sparse Graph Convolution (GCNN).} This is the efficient variant. For each $r$-cochain $i$, we aggregate neighbour features via mean-pooling, combine with a self-projection, and apply a non-linearity:
+\begin{equation}
+    \mathbf{o}_i = \text{LN}\!\left(\mathbf{W}_{\text{self}} \, \mathbf{h}_i + \mathbf{W}_{\text{nbr}} \cdot \frac{1}{|\mathbf{N}^{(r)}(i)|} \sum_{j \in \mathbf{N}^{(r)}(i)} \mathbf{h}_j\right)
+\end{equation}
+Graph convolution has complexity $O(|\mathbf{N}^{(r)}| \cdot d_{\text{model}})$---the same scaling as attention but without the QKV projections, softmax, or gating, yielding roughly a $4\text{--}6\times$ speedup per layer.
+
+\subsubsection{Inter-Rank Cross-Operations}
+
+Cross-rank communication (coboundary $\partial^*$ and boundary $\partial$) can similarly use attention or convolution, mediated by the incidence matrices $\mathbf{I}_{r \to r+1}$. The same bilateral gating structure is used for attention; for convolution, the source features are mean-aggregated over incident cochains and combined with the target state via a gated projection.
+
+\subsection{Bidirectional Topological Block}
+
+A single layer $l$ of the META architecture processes the cochain complex through the following sequential stages, now extended to four ranks:
+
+\begin{tcolorbox}[colframe=black, colback=white!5, title=Single META Layer $l$ (Attention or GCNN variant), width=\linewidth]
+
+\textbf{Stage 1: Intra-Rank Self-Operation.} All ranks process within themselves using the neighbourhood $\mathbf{N}^{(r)} = \mathbf{A}^{(r)} \cup \mathbf{CoA}^{(r)}$:
+\begin{align}
+    \tilde{\mathbf{h}}^{(r),l} &= \mathbf{h}^{(r),l} + \text{Op}^{(r)}_{\text{intra}}(\text{LN}(\mathbf{h}^{(r),l}), \mathbf{N}^{(r)}), \quad r \in \{0, 1, 2, 3\}
+\end{align}
+where $\text{Op}_{\text{intra}}$ is either SelfAttn or GCNN, selected per layer.
+
+\textbf{Stage 2: Upward Pass (Coboundary $\partial^*$).} Information flows from lower to higher ranks:
+\begin{align}
+    \mathbf{h}^{(1),l'} &= \tilde{\mathbf{h}}^{(1),l} + \text{Op}_{\partial^*}(\tilde{\mathbf{h}}^{(1),l} \leftarrow \tilde{\mathbf{h}}^{(0),l}, \; \mathbf{I}_{0 \to 1}) \\
+    \mathbf{h}^{(2),l'} &= \tilde{\mathbf{h}}^{(2),l} + \text{Op}_{\partial^*}(\tilde{\mathbf{h}}^{(2),l} \leftarrow \mathbf{h}^{(1),l'}, \; \mathbf{I}_{1 \to 2}) \\
+    \mathbf{h}^{(3),l'} &= \tilde{\mathbf{h}}^{(3),l} + \text{Op}_{\partial^*}(\tilde{\mathbf{h}}^{(3),l} \leftarrow \mathbf{h}^{(2),l'}, \; \mathbf{I}_{2 \to 3})
+\end{align}
+
+\textbf{Stage 3: Downward Pass (Boundary $\partial$).} Information flows from higher to lower ranks:
+\begin{align}
+    \mathbf{h}^{(2),l''} &= \mathbf{h}^{(2),l'} + \text{Op}_{\partial}(\mathbf{h}^{(2),l'} \leftarrow \mathbf{h}^{(3),l'}, \; \mathbf{I}_{3 \to 2}) \\
+    \mathbf{h}^{(1),l''} &= \mathbf{h}^{(1),l'} + \text{Op}_{\partial}(\mathbf{h}^{(1),l'} \leftarrow \mathbf{h}^{(2),l''}, \; \mathbf{I}_{2 \to 1}) \\
+    \mathbf{h}^{(0),l+1} &= \tilde{\mathbf{h}}^{(0),l} + \text{Op}_{\partial}(\tilde{\mathbf{h}}^{(0),l} \leftarrow \mathbf{h}^{(1),l''}, \; \mathbf{I}_{1 \to 0})
+\end{align}
+
+\textbf{Stage 4: Feedforward Networks.} Each rank receives an independent feedforward sub-layer:
+\begin{align}
+    \mathbf{h}^{(r),l+1} &\leftarrow \mathbf{h}^{(r),l+1} + \text{FFN}^{(r)}(\text{LN}(\mathbf{h}^{(r),l+1})), \quad r \in \{0, 1, 2, 3\}
+\end{align}
+\end{tcolorbox}
+
+The network consists of $L$ stacked META layers with a configurable sequence of layer types (e.g., \texttt{[attn, conv, conv, conv, conv, conv, conv, conv]} for one attention layer followed by seven GCNN layers). We use $L = 8$, $d_{\text{model}} = 256$, and $H = 8$ attention heads in attention layers.
+
+\subsection{Partial Conditional Training via Cochain and Topology Masking}
+
+We introduce a self-supervised auxiliary objective inspired by masked language modeling (MLM), generalized to the cochain complex. During training, a fraction of cochain features and topological connections are randomly masked, and the model is tasked with reconstructing them from the remaining context. This serves three purposes: (1) it regularizes the encoder by forcing it to build redundant, distributed representations rather than relying on any single feature channel; (2) it teaches the model to infer local geometry from global context, which is precisely the skill needed to predict dynamics from static structure; and (3) during inference, controlled masking can be used as a diversity mechanism for more aggressive sampling of designed sequences.
+
+\subsubsection{Feature Masking}
+
+For each rank $r \in \{0, 1, 2, 3\}$, we independently select a fraction $p_{\text{mask}}$ of $r$-cochains uniformly at random and replace their input features with a learnable \textbf{mask token} $\mathbf{m}^{(r)} \in \mathbb{R}^{d_r}$:
+\begin{equation}
+    \tilde{\mathbf{f}}_i^{(r)} = \begin{cases} \mathbf{m}^{(r)} & \text{if } i \in \mathcal{M}^{(r)} \\ \mathbf{f}_i^{(r)} & \text{otherwise} \end{cases}
+\end{equation}
+where $\mathcal{M}^{(r)} \subset \mathcal{C}_r$ is the set of masked cochains at rank $r$, with $|\mathcal{M}^{(r)}| = \lfloor p_{\text{mask}} \cdot |\mathcal{C}_r| \rfloor$. The mask tokens are learned parameters of the model. The encoder processes the masked features $\tilde{\mathbf{f}}^{(r)}$ through the full network, producing latent states $\mathbf{h}^{(r),L}$.
+
+A per-rank reconstruction head $\text{MLP}_{\text{recon}}^{(r)}$ predicts the original features at masked positions:
+\begin{equation}
+    \hat{\mathbf{f}}_i^{(r)} = \text{MLP}_{\text{recon}}^{(r)}(\mathbf{h}_i^{(r),L}), \quad i \in \mathcal{M}^{(r)}
+\end{equation}
+The feature reconstruction loss is the mean squared error over all masked cochains across all ranks:
+\begin{equation}
+    \mathcal{L}_{\text{Recon}} = \sum_{r=0}^{3} \frac{1}{|\mathcal{M}^{(r)}|} \sum_{i \in \mathcal{M}^{(r)}} \|\hat{\mathbf{f}}_i^{(r)} - \mathbf{f}_i^{(r)}\|_2^2
+\end{equation}
+
+\subsubsection{Topology Masking}
+
+In addition to feature masking, we randomly drop a fraction $p_{\text{topo}}$ of entries from the neighbourhood matrices $\mathbf{N}^{(r)}$ (adjacency $\cup$ coadjacency) and the incidence matrices $\mathbf{I}_{r \to r+1}$. Specifically, for each sparse edge in the neighbourhood or incidence matrix, it is independently dropped with probability $p_{\text{topo}}$. The model processes the sparsified topology and must reconstruct the dropped connections.
+
+For neighbourhood reconstruction, given the final latent states of two cochains $i, j$ at rank $r$, a bilinear scorer predicts whether they are neighbours:
+\begin{equation}
+    \hat{a}_{ij}^{(r)} = \sigma\left((\mathbf{h}_i^{(r),L})^\top \mathbf{W}_{\text{topo}}^{(r)} \, \mathbf{h}_j^{(r),L}\right)
+\end{equation}
+For incidence reconstruction, a similar bilinear scorer operates between ranks:
+\begin{equation}
+    \hat{b}_{\sigma\tau} = \sigma\left((\mathbf{h}_\sigma^{(r+1),L})^\top \mathbf{W}_{\text{inc}}^{(r)} \, \mathbf{h}_\tau^{(r),L}\right)
+\end{equation}
+The topology reconstruction loss uses binary cross-entropy over dropped and retained connections (with negative sampling of non-existent connections at a 1:1 ratio):
+\begin{equation}
+    \mathcal{L}_{\text{Topo}} = \sum_{r=0}^{3} \text{BCE}(\hat{a}^{(r)}, a^{(r)}_{\text{gt}}) + \sum_{r=0}^{2} \text{BCE}(\hat{b}^{(r)}, b^{(r)}_{\text{gt}})
+\end{equation}
+
+\subsubsection{Inference-Time Masking for Diversity}
+
+At design time, the masking mechanism provides a natural diversity knob: by applying different random masks to the same input structure, the model generates different latent representations and consequently different designed sequences. This complements the random decoding order used in the autoregressive decoder, providing two orthogonal sources of diversity. The mask ratio at inference can be set independently (typically lower, e.g., $p_{\text{mask}} = 0.05$--$0.15$) from the training ratio ($p_{\text{mask}} = 0.15$--$0.30$).
+
+\subsection{Multi-Objective Training}
+
+After $L$ layers, the final latent states $\mathbf{h}^{(r),L}$ for $r \in \{0, 1, 2, 3\}$ are decoded by dedicated heads to fulfill multiple training objectives. The general form of the total loss is:
+\begin{equation}
+    \mathcal{L}_{\text{Total}} = \alpha \, \mathcal{L}_{\text{Seq/AR}} + \beta \, \mathcal{L}_{\text{Biochem}} + \gamma \, \mathcal{L}_{\text{Dyn}} + \delta \, \mathcal{L}_{\text{Recon}} + \zeta \, \mathcal{L}_{\text{Topo}}
+\end{equation}
+where $\delta, \zeta \geq 0$ control the weight of the reconstruction auxiliary objectives. These auxiliary losses are active throughout all training phases and serve as regularizers.
+
+\subsubsection{Objective 1: Sequence Recovery ($\mathcal{L}_{\text{Seq}}$)}
+
+During training, the node latent states $\mathbf{h}^{(0),L}$ are decoded into a probability distribution over the 20 canonical amino acids via a two-layer MLP with softmax output:
+\begin{equation}
+    p(a_i \mid \mathcal{X}) = \text{softmax}\left(\text{MLP}_{\text{seq}}(\mathbf{h}_i^{(0),L})\right)
+\end{equation}
+The loss is label-smoothed cross-entropy ($\epsilon = 0.1$) against the native wild-type sequence:
+\begin{equation}
+    \mathcal{L}_{\text{Seq}} = -\frac{1}{N} \sum_{i=1}^{N} \left[(1 - \epsilon) \log p(a_i^{\text{wt}}) + \frac{\epsilon}{20} \sum_{a=1}^{20} \log p(a)\right]
+\end{equation}
+
+\subsubsection{Objective 2: Higher-Order Biochemistry ($\mathcal{L}_{\text{Biochem}}$)}
+
+The bend latent states $\mathbf{h}^{(2),L}$ are decoded to predict continuous physicochemical properties of each 3-residue angular microenvironment, ensuring that the 2-cochain representations encode biologically meaningful information. For each bend $t = (i,j,k) \in \mathcal{C}_2$, the target properties are computed from the wild-type amino acid identities of its constituent residues using standard physicochemical scales:
+
+\begin{itemize}
+    \item \textbf{Hydrophobicity} $H_t$: Mean Kyte-Doolittle hydrophobicity of residues $i, j, k$.
+    \item \textbf{Net Charge} $Q_t$: Sum of formal charges at pH 7.4 for residues $i, j, k$.
+    \item \textbf{Steric Volume} $V_t$: Mean van der Waals volume (Zamyatnin scale) for residues $i, j, k$.
+    \item \textbf{H-bond Capacity} $D_t$: Sum of side-chain hydrogen bond donors and acceptors for residues $i, j, k$.
+\end{itemize}
+
+The loss is the mean squared error across all properties and bends:
+\begin{equation}
+    \mathcal{L}_{\text{Biochem}} = \frac{1}{|\mathcal{C}_2|} \sum_{t \in \mathcal{C}_2} \sum_{p \in \{H, Q, V, D\}} \left(\hat{p}_t - p_t^{\text{wt}}\right)^2
+\end{equation}
+where $\hat{p}_t = \text{MLP}_p(\mathbf{h}_t^{(2),L})$ and targets $p_t^{\text{wt}}$ are computed from the native sequence.
+
+\paragraph{Torsion-level biochemistry (from $\mathcal{C}_3$).} Extending the same principle to 3-cochains, the torsion latent states $\mathbf{h}^{(3),L}$ predict physicochemical properties of each 4-residue dihedral microenvironment. For each torsion $\tau = (i,j,k,l) \in \mathcal{C}_3$, the target properties are computed from its four constituent residues using the same scales (mean hydrophobicity, sum charge, mean volume, sum H-bond capacity). The torsion biochemistry loss is:
+\begin{equation}
+    \mathcal{L}_{\text{Biochem}} = \frac{1}{|\mathcal{C}_2|} \sum_{t \in \mathcal{C}_2} \sum_{p} \left(\hat{p}_t - p_t^{\text{wt}}\right)^2 + \frac{1}{|\mathcal{C}_3|} \sum_{\tau \in \mathcal{C}_3} \sum_{p} \left(\hat{p}_\tau - p_\tau^{\text{wt}}\right)^2
+\end{equation}
+The torsion biochemistry context is additionally used as conditioning in the autoregressive decoder, providing the decoder with a richer microenvironmental signal than bends alone.
+
+\subsubsection{Objective 3: Multi-Scale Dynamicity ($\mathcal{L}_{\text{Dyn}}$)}
+
+The network must predict the structural flexibility of the ensemble \textbf{strictly from the static medoid latent space}. We define dynamicity targets at two scales, using richer descriptors than simple distance variance.
+
+\paragraph{Per-residue fluctuation (from $\mathcal{C}_0$).} The primary target is the per-residue mean-square fluctuation (MSF) computed from the ANM ensemble:
+\begin{equation}
+    \text{MSF}_i = \frac{1}{M} \sum_{s=1}^{M} \|\mathbf{r}_i^{(s)} - \bar{\mathbf{r}}_i\|_2^2, \qquad \bar{\mathbf{r}}_i = \frac{1}{M} \sum_{s=1}^{M} \mathbf{r}_i^{(s)}
+\end{equation}
+This is predicted from the node states:
+\begin{equation}
+    \widehat{\text{MSF}}_i = \text{ReLU}(\text{MLP}_{\text{msf}}(\mathbf{h}_i^{(0),L}))
+\end{equation}
+where ReLU ensures non-negativity of the predicted variance.
+
+\paragraph{Pairwise distance covariance (from $\mathcal{C}_1$).} For each edge $(i,j) \in \mathcal{C}_1$, we predict the variance of the pairwise $C_\alpha$ distance across the ensemble:
+\begin{equation}
+    \sigma^2_{ij} = \text{Var}_{s \in \mathcal{T}}\left(\|\mathbf{r}_i^{(s)} - \mathbf{r}_j^{(s)}\|_2\right)
+\end{equation}
+The prediction uses an \textbf{outer-product decoder} that maps per-cell latent states to pairwise quantities:
+\begin{equation}
+    \hat{\sigma}^2_{ij} = \text{ReLU}\left(\text{MLP}_{\text{pair}}\left(\mathbf{W}_a \mathbf{h}_i^{(0),L} \odot \mathbf{W}_b \mathbf{h}_j^{(0),L} + \mathbf{h}_{ij}^{(1),L}\right)\right)
+\end{equation}
+This formulation combines a Hadamard product of projected node states (capturing pairwise interactions) with the edge state (capturing direct contact-level information), addressing the missing pairwise decoder specification in the original proposal.
+
+\paragraph{Combined dynamicity loss.} The dynamicity losses at different scales are normalized by the number of elements at each scale to prevent dominance:
+\begin{equation}
+    \mathcal{L}_{\text{Dyn}} = \frac{1}{N} \sum_{i=1}^{N} (\widehat{\text{MSF}}_i - \text{MSF}_i)^2 + \frac{1}{|\mathcal{C}_1|} \sum_{(i,j) \in \mathcal{C}_1} (\hat{\sigma}^2_{ij} - \sigma^2_{ij})^2
+\end{equation}
+
+\subsection{Dynamics-Conditioned Autoregressive Sequence Generation}
+
+\subsubsection{Motivation}
+One-shot parallel decoding of the sequence, as in the training objective $\mathcal{L}_{\text{Seq}}$, produces independent per-residue predictions that fail to capture inter-residue dependencies in the generated sequence. Following ProteinMPNN, we employ autoregressive decoding at inference time. Our key innovation is \textbf{conditioning the autoregressive decoder on the predicted dynamicity and biochemistry}, ensuring that generated sequences are explicitly shaped by the target flexibility profile.
+
+\subsubsection{Decoding Procedure}
+
+Rather than using a fixed or random permutation as the decoding order, we learn the optimal decoding order via a \textbf{Pointer Network}. The key idea, adapted from set-to-sequence models, is that the model itself should decide which residue to decode next based on which positions are most constrained by the currently available context.
+
+\paragraph{Pointer network formulation.} Given the encoder node embeddings $\mathbf{e}_i = \mathbf{h}_i^{(0),L}$ for $i = 1, \ldots, N$, the pointer network maintains a recurrent hidden state $\mathbf{d}_t$ (initialized as the mean embedding). At each step $t$, it computes an attention score over all unselected positions:
+\begin{equation}
+    u_i^t = \mathbf{v}^\top \tanh(\mathbf{W}_1 \mathbf{e}_i + \mathbf{W}_2 \mathbf{d}_t), \qquad P(\pi_t = i \mid \pi_{<t}, \mathcal{X}) = \text{softmax}(u^t)
+\end{equation}
+where $\mathbf{W}_1, \mathbf{W}_2, \mathbf{v}$ are learnable parameters and the softmax is taken over positions not yet selected (already-selected positions have $u_i^t = -\infty$). The position $\pi_t$ is sampled from this distribution during training (via multinomial sampling for REINFORCE) or taken as the argmax during inference. The hidden state is updated via a GRU: $\mathbf{d}_{t+1} = \text{GRU}(\mathbf{e}_{\pi_t}, \mathbf{d}_t)$.
+
+\paragraph{Chunked decoding.} To interpolate between fully parallel and fully sequential decoding, we decode $L$ residues per step. At each pointer step, the top-$L$ positions are selected, their amino acids are decoded simultaneously, and the hidden state is updated with their mean embedding. Setting $L = 1$ gives fully sequential AR; $L = N$ recovers parallel decoding. During training, $L$ is treated as a hyperparameter that can be annealed from large to small values.
+
+\paragraph{Conditioning vector.} For residue $\pi_t$, the conditioning vector aggregates the node latent, predicted MSF, bend context, and torsion biochemistry context:
+\begin{equation}
+    \mathbf{c}_{\pi_t} = \mathbf{h}_{\pi_t}^{(0),L} \; \| \; \text{Emb}(\widehat{\text{MSF}}_{\pi_t}) \; \| \; \frac{1}{|\mathcal{N}_2(\pi_t)|}\sum_{\tau \in \mathcal{N}_2(\pi_t)} \mathbf{h}_\tau^{(2),L} \; \| \; \frac{1}{|\mathcal{N}_3(\pi_t)|}\sum_{\rho \in \mathcal{N}_3(\pi_t)} \mathbf{h}_\rho^{(3),L}
+\end{equation}
+where $\|$ denotes concatenation, $\text{Emb}(\cdot)$ is a learned embedding of the discretized MSF value (into 32 bins), $\mathcal{N}_2(\pi_t)$ is the set of bends containing residue $\pi_t$, and $\mathcal{N}_3(\pi_t)$ is the set of torsions containing residue $\pi_t$.
+
+\paragraph{Epistasis analysis from decoding order.} The learned decoding order provides a novel tool for analyzing residue coupling. By running inference from multiple random initializations and recording the resulting permutation matrices, we construct a \emph{decoding co-occurrence matrix}: positions that are consistently decoded together (in the same chunk) or in immediate succession are likely epistatically coupled. This matrix can be compared against coevolution signals from natural MSAs to validate the model's learned coupling structure.
+
+\paragraph{Autoregressive context.} Previously decoded residues are injected via a learned amino acid embedding $\mathbf{e}(a) \in \mathbb{R}^{d_{\text{model}}}$. At step $t$, we update the node states with decoded information:
+\begin{equation}
+    \hat{\mathbf{h}}_{\pi_s}^{(0)} = \mathbf{h}_{\pi_s}^{(0),L} + \mathbf{e}(a_{\pi_s}) \quad \text{for } s < t, \qquad \hat{\mathbf{h}}_{\pi_s}^{(0)} = \mathbf{h}_{\pi_s}^{(0),L} \quad \text{for } s \geq t
+\end{equation}
+A lightweight 2-layer Transformer decoder attends over the updated node states with causal masking (only previously decoded positions are visible) to produce the logits:
+\begin{equation}
+    p(a_{\pi_t} \mid a_{\pi_{<t}}, \mathcal{X}, \widehat{\text{MSF}}) = \text{softmax}\left(\text{MLP}_{\text{AR}}\left(\text{TransformerDec}(\mathbf{c}_{\pi_t}, \hat{\mathbf{H}}^{(0)})\right)\right)
+\end{equation}
+
+\paragraph{Sampling strategy.} At inference, we sample $a_{\pi_t} \sim p(\cdot)$ with temperature $\tau$ and optionally apply nucleus (top-$p$) filtering. Multiple sequences are generated with different random decoding orders $\pi$ and ranked by the joint log-probability $\sum_t \log p(a_{\pi_t} \mid a_{\pi_{<t}})$.
+
+\subsubsection{Training the Autoregressive Head}
+The AR decoder is trained jointly with the main encoder using teacher forcing. During training, the ground-truth amino acid identities are provided for $s < t$, and the loss is the standard autoregressive cross-entropy:
+\begin{equation}
+    \mathcal{L}_{\text{AR}} = -\frac{1}{N} \sum_{t=1}^{N} \log p(a_{\pi_t}^{\text{wt}} \mid a_{\pi_{<t}}^{\text{wt}}, \mathcal{X}, \widehat{\text{MSF}})
+\end{equation}
+The total training loss becomes:
+\begin{equation}
+    \mathcal{L}_{\text{Total}} = \alpha \, \mathcal{L}_{\text{AR}} + \beta \, \mathcal{L}_{\text{Biochem}} + \gamma \, \mathcal{L}_{\text{Dyn}}
+\end{equation}
+During the final phase of training, $\mathcal{L}_{\text{Seq}}$ (one-shot) is replaced by $\mathcal{L}_{\text{AR}}$ (autoregressive), as described in the training curriculum below.
+
+\subsubsection{Training Curriculum}
+\label{sec:curriculum}
+We employ a four-phase training schedule to stabilize multi-objective optimization:
+\begin{enumerate}
+    \item \textbf{Phase 1 (Encoder warm-up, epochs 1--20):} Train with $\mathcal{L}_{\text{Seq}}$ (one-shot parallel) and $\mathcal{L}_{\text{Biochem}}$ (bend + torsion) only ($\gamma = 0$). This allows the encoder to learn meaningful structural and biochemical representations.
+    \item \textbf{Phase 2 (Dynamics introduction, epochs 21--50):} Linearly ramp $\gamma$ from 0 to its target value while maintaining $\mathcal{L}_{\text{Seq}}$ and $\mathcal{L}_{\text{Biochem}}$.
+    \item \textbf{Phase 3 (AR with learned order, epochs 51--100):} Replace $\mathcal{L}_{\text{Seq}}$ with $\mathcal{L}_{\text{AR}}$ using teacher forcing. Activate the pointer network. The chunk size $L$ starts at $N/4$ and is annealed to 1 over the phase. The pointer network is trained jointly via REINFORCE: the sequence CE loss at each position serves as the reward signal for the pointer's selection policy.
+    \item \textbf{Phase 4 (Fine-tuning, optional):} Continue training with $L=1$ (fully sequential) and scheduled sampling (20\% of positions use model predictions). This phase is used for downstream tasks (e.g., peptide-MHC-TCR design).
+\end{enumerate}
+We use AdamW with learning rate $3 \times 10^{-4}$, linear warm-up over 1000 steps, and cosine decay. Gradient clipping is applied at norm 1.0. The masking objectives $\mathcal{L}_{\text{Recon}}$ and $\mathcal{L}_{\text{Topo}}$ are active throughout all phases as regularizers.
+
+\subsection{Inference Workflow for Protein Design}
+
+At design time, the user provides a target backbone structure (e.g., from computational design, homology modeling, or an experimental structure). The inference pipeline proceeds as:
+\begin{enumerate}
+    \item \textbf{Ensemble generation:} Run ANM on the target backbone to produce the conformational ensemble $\mathcal{T}$ and extract the medoid $t_{\text{med}}$. This takes $<$5 seconds per protein.
+    \item \textbf{CC construction:} Build the Combinatorial Complex from the medoid.
+    \item \textbf{Encoder forward pass:} Compute latent states $\mathbf{h}^{(r),L}$ for all ranks.
+    \item \textbf{Dynamicity prediction:} Predict $\widehat{\text{MSF}}_i$ and $\hat{\sigma}^2_{ij}$ from the encoder latents.
+    \item \textbf{Autoregressive decoding:} Generate $S$ candidate sequences (e.g., $S = 100$) using the pointer network's learned decoding order, conditioned on the predicted MSF, bend biochemistry, and torsion biochemistry contexts. Different random seeds for the pointer initialization yield diverse decoding orders and thus diverse sequences.
+    \item \textbf{Ranking:} Rank candidates by joint log-probability and optionally filter by forward-fold validation (AlphaFold2 pTM $> 0.8$, backbone RMSD $< 2$\AA).
+\end{enumerate}
+Notably, the user does \emph{not} need an experimental ensemble or MD trajectory---only a single backbone structure. The ANM ensemble is generated automatically as a preprocessing step, making the pipeline compatible with any source of backbone coordinates, including computationally designed scaffolds.
+
+\subsection{SE(3)-Invariance Considerations}
+
+All input features to the network are constructed to be SE(3)-invariant (invariant to global rotation and translation):
+\begin{itemize}
+    \item Dihedral angles, bond angles, distances, areas, and perimeters are intrinsically invariant.
+    \item The unit direction vector $\hat{\mathbf{d}}_{ij}$ is projected into a \emph{local} backbone frame (defined by $N$-$C_\alpha$-$C$ at residue $i$), making it invariant to global rotation.
+    \item The neighbourhood and incidence masks are defined by distance cutoffs and topological membership, both of which are SE(3)-invariant.
+\end{itemize}
+The attention mechanism operates on scalar representations (no vector or equivariant features), ensuring the entire architecture is SE(3)-invariant by construction. This is a deliberate design choice trading equivariant expressivity for architectural simplicity and computational efficiency, following the approach of ProteinMPNN.
+
+\subsection{Computational Complexity and Cost}
+
+\subsubsection{Ensemble Generation}
+ANM eigendecomposition of the Hessian $\mathbf{H} \in \mathbb{R}^{3N \times 3N}$ has complexity $O(N^3)$. For a typical 300-residue protein, this takes $\sim$2 seconds on a single CPU core. Generating 1000 conformers by linear superposition of modes is $O(NKM) \approx 6 \times 10^6$ operations, which is negligible. Total preprocessing per protein: $<$5 seconds, compared to $\sim$1 hour for a 100 ns MD simulation.
+
+\subsubsection{Network Forward Pass}
+Let $N_0 = N$, $N_1 = |\mathcal{C}_1|$, $N_2 = |\mathcal{C}_2|$. Self-attention at rank $r$ has a dense complexity of $O(N_r^2 \cdot d_{\text{model}})$, but because all attention operations are masked by the neighbourhood or incidence matrices, the effective complexity is $O(\text{nnz}(\mathbf{N}^{(r)}) \cdot d_{\text{model}})$. For a 300-residue protein with $\sim$3000 edges and $\sim$5000 triangles, the edge neighbourhood is sparse (each edge shares nodes with $\sim$50 other edges on average), yielding $\sim$150,000 non-zero entries rather than $9 \times 10^6$. Using sparse attention kernels (e.g., via block-sparse representations or scatter-gather operations in PyTorch), the bottleneck reduces to approximately $4 \times 10^7$ operations per layer per rank. With $L = 8$ layers and mixed-precision training on a single A100 GPU, the total forward pass takes $\sim$200ms per protein.
+
+\subsubsection{Comparison to Baselines}
+ProteinMPNN uses $O(N \cdot k^2 \cdot d)$ per layer (where $k \sim 30$ is the $k$-nearest neighbors), which is more efficient per layer but does not model higher-order interactions. Our architecture trades $\sim$3--5$\times$ computational overhead for explicit packing-aware and dynamics-aware representations.
+
+\section{Proposed Experimental Validation}
+
+\subsection{Training Data and Splits}
+\label{sec:data}
+
+\subsubsection{Structure Curation}
+We train on protein chains from the Protein Data Bank (PDB) filtered to resolution $\leq 3.5$\AA{} (X-ray crystallography and cryo-EM), sequence identity $\leq 40\%$ (clustered via MMseqs2 \texttt{easy-cluster --min-seq-id 0.40 -c 0.8}), and chain length between 30 and 500 residues. Structures with $>5\%$ missing backbone atoms are excluded. Multi-chain complexes are processed as single higher-order graphs without explicit chain labels (Section~\ref{sec:implicit_multichain}). Each chain within a complex is treated as a separate training example with its partner chains providing structural context through cross-chain edges.
+
+\subsubsection{Train/Validation/Test Splits}
+The CATH 4.3 topology-level split is used: an 80/10/10 partition of CATH topology codes assigns structures to train/validation/test sets such that no topology code appears in more than one split. We estimate approximately 25,000 chains for training, 3,000 for validation, and 3,000 for testing. Additionally, we apply Foldseek TM-score filtering to ensure no test structure has TM-score $\geq 0.5$ to any training structure, following the stringent protocol of ESM-IF1.
+
+\subsubsection{Dynamics Preprocessing}
+For each training protein, the ANM conformational ensemble (1000 conformers, 20 modes) is precomputed with ProDy and cached as a compressed \texttt{.npz} file. The total preprocessing storage is approximately 35 GB. Dynamics targets (MSF, pairwise distance variance) are computed from the cached ensembles and stored alongside the cochain complex features. Training proteins without sufficiently many contacts for ANM ($<30$ residues or disconnected contact graphs) are trained with $\gamma = 0$ (no dynamics loss).
+
+\subsubsection{Lazy Data Loading}
+The dataset uses lazy on-disk loading: each protein is stored as a single \texttt{.npz} file loaded on demand during training, never accumulating the full dataset in memory. Variable-length proteins are collated via concatenation with offset indexing (PyG-style batching) using per-rank batch vectors.
+
+\subsection{Benchmarks}
+We evaluate on the CATH 4.3 topology-split test set (following ProteinMPNN conventions) and additionally curate a \textbf{Dynamic Protein Benchmark} comprising:
+\begin{itemize}
+    \item 50 allosteric enzymes with known conformational changes (from the MolMovDB database).
+    \item 30 proteins with high-quality NMR order parameter ($S^2$) data.
+    \item 20 proteins with extensive MD trajectories available for comparison.
+\end{itemize}
+
+\subsection{Metrics}
+\begin{itemize}
+    \item \textbf{Sequence recovery rate}: Fraction of native residues recovered (standard metric).
+    \item \textbf{MSF correlation}: Pearson $\rho$ between predicted and ground-truth per-residue MSF.
+    \item \textbf{Flexibility-weighted recovery}: Sequence recovery stratified by dynamicity quintile, measuring whether the model performs consistently across rigid and flexible regions.
+    \item \textbf{Forward-fold validation}: AlphaFold2 pTM and pLDDT of designed sequences, plus RMSD to the target backbone.
+    \item \textbf{Ensemble preservation}: For designed sequences, re-run ANM on the AlphaFold2-predicted structure and compute the Pearson correlation between the re-predicted MSF profile and the original target MSF profile.
+\end{itemize}
+
+\subsection{Ablation Studies}
+\label{sec:ablations}
+\begin{enumerate}
+    \item \textbf{Input source}: Medoid vs.\ random ensemble frame vs.\ crystal structure (no ensemble).
+    \item \textbf{Dynamicity loss}: Full $\mathcal{L}_{\text{Dyn}}$ vs.\ MSF-only vs.\ no dynamicity loss.
+    \item \textbf{Biochemistry loss}: Full 4-property $\mathcal{L}_{\text{Biochem}}$ vs.\ $H + Q$ only vs.\ no biochemistry loss.
+    \item \textbf{Higher-order ranks}: Full cochain complex ($\mathcal{C}_0, \mathcal{C}_1, \mathcal{C}_2, \mathcal{C}_3$) vs.\ graph-only ($\mathcal{C}_0, \mathcal{C}_1$) vs.\ bends-only ($\mathcal{C}_0, \mathcal{C}_1, \mathcal{C}_2$).
+    \item \textbf{Autoregressive decoding}: AR with dynamics conditioning vs.\ AR without conditioning vs.\ one-shot parallel decode.
+    \item \textbf{Leakage quantification}: Mutual information between medoid node degree and MSF targets.
+\end{enumerate}
+
+\section{Limitations and Future Work}
+
+\paragraph{Harmonic approximation.} ANM normal modes capture collective, low-frequency motions well but assume a harmonic energy landscape. Large-amplitude motions, barrier crossings, and allosteric transitions involving multiple distinct conformational basins are poorly described. Future work will explore combining ANM with enhanced sampling methods or learned energy functions.
+
+\paragraph{Sidechain dynamics.} The current framework operates on the backbone $C_\alpha$ trace. Sidechain rotameric fluctuations, which are critical for enzyme active sites, are not modeled. Extending the CC to include sidechain atoms as additional nodes (or rotamer states as node features) is a natural extension.
+
+\paragraph{Multi-domain proteins.} The global medoid may poorly represent multi-domain proteins with independent hinge motions. Domain-wise medoid selection or a mixture of medoids could address this.
+
+\paragraph{Generalization to novel folds.} The model is trained on existing PDB structures. Its ability to generalize to computationally designed folds without experimental structures remains to be validated.
+
+\section{Conclusion}
+We have presented META, a generative framework for dynamics-aware inverse protein folding that bridges the gap between static sequence design and conformational biophysics. By representing proteins as Combinatorial Complexes, employing physically grounded ANM ensembles, and training with a multi-objective loss that includes explicit dynamicity prediction, META generates sequences intrinsically tailored to support wild-type flexibility profiles. The dynamics-conditioned autoregressive decoder ensures that sequence generation is guided not only by structural fit but by the target biophysical behavior. We anticipate that this framework will be particularly impactful for the design of functional proteins whose activity depends on conformational flexibility.
+
+\end{document}
