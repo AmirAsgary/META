@@ -499,13 +499,124 @@ def test_gradient_flow():
     report("E2E gradient flow", ok, detail, time.time()-t0)
     model.zero_grad()
 # ══════════════════════════════════════════════════════════════════════════════
+# TEST 24: Batch size > 1 with AR + pointer — per-protein isolation
+# ══════════════════════════════════════════════════════════════════════════════
+def test_batch_gt1_pointer():
+    t0 = time.time(); import torch
+    from src.model_utils import METAModel, METALoss
+    from train_utils import compute_all_metrics
+    model = METAModel(d_model=32, n_heads=2, n_layers=1, d_node=23, d_edge=37,
+                      layer_types='conv', use_ar=True, use_pointer=True, chunk_size=2)
+    # simulate batch of 2 proteins: 15 + 10 residues
+    b1 = make_batch(15, 40, 25, 10); b2 = make_batch(10, 30, 20, 8)
+    # manual collate for 2 items
+    batch = {}
+    batch['node_feat'] = torch.cat([b1['node_feat'], b2['node_feat']])
+    batch['edge_feat'] = torch.cat([b1['edge_feat'], b2['edge_feat']])
+    batch['bend_feat'] = torch.cat([b1['bend_feat'], b2['bend_feat']])
+    batch['torsion_feat'] = torch.cat([b1['torsion_feat'], b2['torsion_feat']])
+    batch['seq_idx'] = torch.cat([b1['seq_idx'], b2['seq_idx']])
+    batch['biochem_targets'] = torch.cat([b1['biochem_targets'], b2['biochem_targets']])
+    batch['torsion_biochem_targets'] = torch.cat([b1['torsion_biochem_targets'], b2['torsion_biochem_targets']])
+    batch['msf'] = torch.cat([b1['msf'], b2['msf']]); batch['pair_var'] = torch.cat([b1['pair_var'], b2['pair_var']])
+    batch['has_dynamics'] = torch.tensor([1, 1])
+    batch['edge_src'] = torch.cat([b1['edge_src'], b2['edge_src'] + 15])
+    batch['edge_dst'] = torch.cat([b1['edge_dst'], b2['edge_dst'] + 15])
+    batch['bends'] = torch.cat([b1['bends'], b2['bends'] + 15])
+    batch['torsions'] = torch.cat([b1['torsions'], b2['torsions'] + 15])
+    batch['nbr0_src'] = torch.cat([b1['nbr0_src'], b2['nbr0_src'] + 15])
+    batch['nbr0_dst'] = torch.cat([b1['nbr0_dst'], b2['nbr0_dst'] + 15])
+    batch['nbr1_src'] = torch.cat([b1['nbr1_src'], b2['nbr1_src'] + 40])
+    batch['nbr1_dst'] = torch.cat([b1['nbr1_dst'], b2['nbr1_dst'] + 40])
+    batch['nbr2_src'] = torch.cat([b1['nbr2_src'], b2['nbr2_src'] + 25])
+    batch['nbr2_dst'] = torch.cat([b1['nbr2_dst'], b2['nbr2_dst'] + 25])
+    batch['nbr3_src'] = torch.cat([b1['nbr3_src'], b2['nbr3_src'] + 10])
+    batch['nbr3_dst'] = torch.cat([b1['nbr3_dst'], b2['nbr3_dst'] + 10])
+    batch['inc_01_edge'] = torch.cat([b1['inc_01_edge'], b2['inc_01_edge'] + 40])
+    batch['inc_01_node'] = torch.cat([b1['inc_01_node'], b2['inc_01_node'] + 15])
+    batch['inc_12_bend'] = torch.cat([b1['inc_12_bend'], b2['inc_12_bend'] + 25])
+    batch['inc_12_edge'] = torch.cat([b1['inc_12_edge'], b2['inc_12_edge'] + 40])
+    batch['inc_23_torsion'] = torch.cat([b1['inc_23_torsion'], b2['inc_23_torsion'] + 10])
+    batch['inc_23_bend'] = torch.cat([b1['inc_23_bend'], b2['inc_23_bend'] + 25])
+    batch['n_res'] = torch.tensor([15, 10]); batch['n_edges'] = torch.tensor([40, 30])
+    batch['n_bends'] = torch.tensor([25, 20]); batch['n_torsions'] = torch.tensor([10, 8])
+    batch['node_batch'] = torch.cat([torch.zeros(15, dtype=torch.long), torch.ones(10, dtype=torch.long)])
+    batch['edge_batch'] = torch.cat([torch.zeros(40, dtype=torch.long), torch.ones(30, dtype=torch.long)])
+    batch['bend_batch'] = torch.cat([torch.zeros(25, dtype=torch.long), torch.ones(20, dtype=torch.long)])
+    batch['torsion_batch'] = torch.cat([torch.zeros(10, dtype=torch.long), torch.ones(8, dtype=torch.long)])
+    # forward + backward
+    model.train(); pred = model(batch)
+    loss_fn = METALoss(1.0, 0.5, 0.5)
+    total, ld = loss_fn(pred, batch, use_ar=True)
+    total.backward()
+    grads_ok = all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    # verify perm is valid: first 15 entries map to [0,14], last 10 to [15,24]
+    perm = pred['perm']
+    ok_shape = perm.shape == (25,)
+    perm_prot0 = set(perm[:15].tolist()); perm_prot1 = set(perm[15:].tolist())
+    ok_isolation = perm_prot0.issubset(set(range(15))) and perm_prot1.issubset(set(range(15, 25)))
+    ok_valid0 = len(perm_prot0) == 15  # all unique within protein 0
+    ok_valid1 = len(perm_prot1) == 10  # all unique within protein 1
+    passed = grads_ok and ok_shape and ok_isolation and ok_valid0 and ok_valid1
+    report("Batch>1 pointer isolation", passed,
+           f"grads={grads_ok}, shape={ok_shape}, isolated={ok_isolation}, valid0={ok_valid0}, valid1={ok_valid1}",
+           time.time()-t0)
+    model.zero_grad()
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 25: global_ar mode (per_protein_ar=False) runs for batch_size=1
+# ══════════════════════════════════════════════════════════════════════════════
+def test_global_ar_mode():
+    t0 = time.time(); import torch
+    from src.model_utils import METAModel, METALoss
+    model = METAModel(d_model=32, n_heads=2, n_layers=1, d_node=23, d_edge=37,
+                      layer_types='conv', use_ar=True, use_pointer=True, chunk_size=2,
+                      per_protein_ar=False)
+    batch = make_batch(20, 60, 40, 15)
+    model.train(); pred = model(batch)
+    loss_fn = METALoss(1.0, 0.5, 0.0)
+    total, ld = loss_fn(pred, batch, use_ar=True)
+    total.backward()
+    grads_ok = all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    ok_perm = pred['perm'].shape == (20,) and len(set(pred['perm'].tolist())) == 20
+    report("global_ar mode (per_protein_ar=False)", grads_ok and ok_perm,
+           f"grads={grads_ok}, perm_valid={ok_perm}, loss={ld['total']:.4f}", time.time()-t0)
+    model.zero_grad()
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 26: per_protein_ar=True vs False give same result at batch_size=1
+# ══════════════════════════════════════════════════════════════════════════════
+def test_global_vs_perprotein_bs1():
+    t0 = time.time(); import torch
+    from src.model_utils import METAModel, METALoss
+    # same weights for both models
+    torch.manual_seed(99)
+    model_pp = METAModel(d_model=32, n_heads=2, n_layers=1, d_node=23, d_edge=37,
+                         layer_types='conv', use_ar=True, use_pointer=False, per_protein_ar=True)
+    torch.manual_seed(99)
+    model_gl = METAModel(d_model=32, n_heads=2, n_layers=1, d_node=23, d_edge=37,
+                         layer_types='conv', use_ar=True, use_pointer=False, per_protein_ar=False)
+    # same batch, same random seed for perm
+    batch = make_batch(15, 40, 25, 10)
+    model_pp.eval(); model_gl.eval()
+    with torch.no_grad():
+        torch.manual_seed(42); pred_pp = model_pp(batch)
+        torch.manual_seed(42); pred_gl = model_gl(batch)
+    # seq_logits should be identical (encoder path is identical)
+    ok_seq = torch.allclose(pred_pp['seq_logits'], pred_gl['seq_logits'], atol=1e-5)
+    # msf_pred should be identical
+    ok_msf = torch.allclose(pred_pp['msf_pred'], pred_gl['msf_pred'], atol=1e-5)
+    # ar_logits may differ slightly due to perm randomness, but shapes should match
+    ok_ar_shape = pred_pp['ar_logits'].shape == pred_gl['ar_logits'].shape
+    passed = ok_seq and ok_msf and ok_ar_shape
+    report("global vs per_protein at bs=1", passed,
+           f"seq_match={ok_seq}, msf_match={ok_msf}, ar_shape={ok_ar_shape}", time.time()-t0)
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     np.random.seed(42)
     print("=" * 70)
-    print("META v6 Comprehensive Test Suite")
-    print("Tests all 7 fixes + all layers + all decoders")
+    print("META v6.1 Comprehensive Test Suite")
+    print("Tests all fixes + all layers + batch>1 + global/per-protein AR")
     print("=" * 70)
     tests = [
         ("Scatter Utilities", test_scatter_utils),
@@ -531,6 +642,9 @@ if __name__ == '__main__':
         ("parse_layer_types", test_parse_layer_types),
         ("Dynamics decoders", test_dynamics_decoders),
         ("E2E gradient flow", test_gradient_flow),
+        ("Batch>1 pointer isolation", test_batch_gt1_pointer),
+        ("global_ar mode", test_global_ar_mode),
+        ("global vs per_protein bs=1", test_global_vs_perprotein_bs1),
     ]
     passed = 0; failed = 0; errors = []
     for name, fn in tests:

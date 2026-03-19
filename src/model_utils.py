@@ -309,11 +309,12 @@ class METAModel(nn.Module):
                  d_node=23, d_edge=37, d_bend=1, d_torsion=2,
                  use_ar=False, n_msf_bins=32,
                  layer_types='attn', mask_ratio=0.0, topo_mask_ratio=0.0,
-                 use_pointer=False, chunk_size=1):
+                 use_pointer=False, chunk_size=1, per_protein_ar=True):
         super().__init__()
         self.d_model = d_model; self.n_layers = n_layers; self.use_ar = use_ar
         self.mask_ratio = mask_ratio; self.topo_mask_ratio = topo_mask_ratio
         self.use_pointer = use_pointer; self.chunk_size = chunk_size
+        self.per_protein_ar = per_protein_ar
         self.d_feats = [d_node, d_edge, d_bend, d_torsion]
         self.proj = nn.ModuleList([InputProjection(d, d_model) for d in self.d_feats])
         self.masker = CochainMasker(self.d_feats)
@@ -356,12 +357,44 @@ class METAModel(nn.Module):
         ctx = torch.zeros(N0, d, device=dev, dtype=dt).scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, d), flat_h)
         cnt = torch.zeros(N0, device=dev, dtype=dt).scatter_add_(0, flat_idx, torch.ones(M * C, device=dev, dtype=dt))
         return ctx / (cnt.unsqueeze(1) + 1e-8)
-    def _discretize_msf(self, msf_pred, n_bins=32):
-        """Discretize predicted MSF into bins."""
+    def _discretize_msf(self, msf_pred, node_batch=None, n_bins=32):
+        """Discretize predicted MSF into bins. Per-protein normalization when batched."""
         lm = torch.log1p(msf_pred.detach().clamp(min=0))
-        vn, vx = lm.min(), lm.max()
-        if vx - vn < 1e-8: return torch.zeros_like(lm, dtype=torch.long)
-        return ((lm - vn) / (vx - vn + 1e-8) * n_bins).long().clamp(0, n_bins - 1)
+        if node_batch is None or node_batch.max() == 0:
+            vn, vx = lm.min(), lm.max()
+            if vx - vn < 1e-8: return torch.zeros_like(lm, dtype=torch.long)
+            return ((lm - vn) / (vx - vn + 1e-8) * n_bins).long().clamp(0, n_bins - 1)
+        # per-protein binning to avoid cross-protein normalization artifacts
+        bins = torch.zeros_like(lm, dtype=torch.long)
+        for b in range(node_batch.max().item() + 1):
+            m = node_batch == b; lb = lm[m]; vn, vx = lb.min(), lb.max()
+            if vx - vn < 1e-8: continue
+            bins[m] = ((lb - vn) / (vx - vn + 1e-8) * n_bins).long().clamp(0, n_bins - 1)
+        return bins
+    def _run_pointer_per_protein(self, h0, node_batch):
+        """Run pointer network independently per protein, concatenate with offsets."""
+        dev = h0.device
+        if node_batch is None or node_batch.max() == 0:
+            return self.pointer_net(h0, self.chunk_size)
+        B = node_batch.max().item() + 1
+        perm_parts, lp_parts = [], []; offset = 0
+        for b in range(B):
+            mask_b = node_batch == b; h_b = h0[mask_b]
+            p_b, lp_b = self.pointer_net(h_b, self.chunk_size)
+            perm_parts.append(p_b + offset); lp_parts.append(lp_b)
+            offset += mask_b.sum().item()
+        return torch.cat(perm_parts), torch.cat(lp_parts)
+    @staticmethod
+    def _random_perm_per_protein(N, node_batch, device):
+        """Generate independent random permutation per protein."""
+        if node_batch is None or node_batch.max() == 0:
+            return torch.randperm(N, device=device)
+        perm = torch.zeros(N, dtype=torch.long, device=device); offset = 0
+        for b in range(node_batch.max().item() + 1):
+            mask_b = node_batch == b; n_b = mask_b.sum().item()
+            perm[offset:offset + n_b] = torch.where(mask_b)[0][torch.randperm(n_b, device=device)]
+            offset += n_b
+        return perm
     def forward(self, batch):
         dev = batch['node_feat'].device
         orig_feats = [batch['node_feat'], batch['edge_feat'], batch['bend_feat'], batch['torsion_feat']]
@@ -381,17 +414,24 @@ class METAModel(nn.Module):
         if self.use_ar and hasattr(self, 'ar_decoder'):
             bend_ctx = self._pool_context(h[2], 'bends', h[0], batch)
             torsion_ctx = self._pool_context(h[3], 'torsions', h[0], batch)
-            msf_bins = self._discretize_msf(out['msf_pred'].detach())
-            # FIX #2: pointer network gets gradients (no .detach() on h[0])
+            nb = batch.get('node_batch') if self.per_protein_ar else None
+            msf_bins = self._discretize_msf(out['msf_pred'].detach(), nb)
+            # build permutation (pointer or random)
             if self.use_pointer and hasattr(self, 'pointer_net'):
-                perm, ptr_log_probs = self.pointer_net(h[0], self.chunk_size)
+                if self.per_protein_ar:
+                    perm, ptr_log_probs = self._run_pointer_per_protein(h[0], nb)
+                else:
+                    perm, ptr_log_probs = self.pointer_net(h[0], self.chunk_size)
                 out['ptr_log_probs'] = ptr_log_probs; out['perm'] = perm
             else:
-                perm = torch.randperm(h[0].shape[0], device=dev)
+                if self.per_protein_ar:
+                    perm = self._random_perm_per_protein(h[0].shape[0], nb, dev)
+                else:
+                    perm = torch.randperm(h[0].shape[0], device=dev)
                 out['perm'] = perm
             # FIX #1: proper AR with TransformerDecoder + teacher forcing
             # FIX BUG2: pass node_batch to block cross-protein attention
-            out['ar_logits'] = self.ar_decoder(h[0], msf_bins, bend_ctx, torsion_ctx, batch['seq_idx'], perm, batch.get('node_batch'))
+            out['ar_logits'] = self.ar_decoder(h[0], msf_bins, bend_ctx, torsion_ctx, batch['seq_idx'], perm, nb)
         # feature reconstruction
         out['recon_preds'] = []; out['recon_targets'] = []; out['recon_masks'] = masks
         for r in range(4):

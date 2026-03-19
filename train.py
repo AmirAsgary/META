@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument('--layer_types', type=str, default='attn', help='Comma-separated: attn or conv per layer')
     p.add_argument('--use_ar', action='store_true', help='Enable autoregressive decoding')
     p.add_argument('--use_pointer', action='store_true', help='Use pointer network for learned decoding order')
+    p.add_argument('--per_protein_ar', action='store_true', default=True, help='Run pointer/AR per protein (correct for batch>1)')
+    p.add_argument('--global_ar', dest='per_protein_ar', action='store_false', help='Run pointer/AR globally (fast, batch_size=1 only)')
     p.add_argument('--n_msf_bins', type=int, default=32)
     # masking
     p.add_argument('--mask_ratio', type=float, default=0.0, help='Feature masking ratio (0=off, 0.15=typical)')
@@ -102,9 +104,9 @@ def main():
         d_node=d_node, d_edge=d_edge, d_bend=d_bend, d_torsion=d_torsion,
         use_ar=args.use_ar, n_msf_bins=args.n_msf_bins,
         layer_types=args.layer_types, mask_ratio=args.mask_ratio, topo_mask_ratio=args.topo_mask_ratio,
-        use_pointer=args.use_pointer, chunk_size=1).to(device)
+        use_pointer=args.use_pointer, chunk_size=1, per_protein_ar=args.per_protein_ar).to(device)
     from train_utils import count_parameters
-    logger.info(f"Params: {count_parameters(model):,}, layers: {args.layer_types}, pointer={args.use_pointer}")
+    logger.info(f"Params: {count_parameters(model):,}, layers: {args.layer_types}, pointer={args.use_pointer}, per_protein_ar={args.per_protein_ar}")
     # ── Optimizer + Scheduler ──
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(train_dl) * args.epochs
