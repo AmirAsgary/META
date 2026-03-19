@@ -283,6 +283,15 @@ def test_vectorized_pool():
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST 12: Full model forward + backward (conv, no AR)
 # ══════════════════════════════════════════════════════════════════════════════
+def _check_grads(model, skip_unused_heads=True):
+    """Check all params got gradients, optionally skipping recon/topo heads (unused when masking=0)."""
+    no_grad = []
+    skip_prefixes = ('recon_heads', 'topo_nbr_heads', 'topo_inc_heads') if skip_unused_heads else ()
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is None:
+            if any(name.startswith(s) for s in skip_prefixes): continue
+            no_grad.append(name)
+    return len(no_grad) == 0, no_grad
 def test_full_model_conv():
     t0 = time.time(); import torch
     from src.model_utils import METAModel, METALoss
@@ -293,10 +302,10 @@ def test_full_model_conv():
     loss_fn = METALoss(1.0, 0.5, 0.5)
     total, ld = loss_fn(pred, batch)
     total.backward()
-    grads_ok = all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    grads_ok, no_grad = _check_grads(model)
     met = compute_all_metrics(pred, batch)
     report("Full model (conv,conv)", grads_ok,
-           f"loss={ld['total']:.4f}, rec={met['recovery']:.3f}", time.time()-t0)
+           f"loss={ld['total']:.4f}, rec={met['recovery']:.3f}" + (f", missing={no_grad[:3]}" if not grads_ok else ""), time.time()-t0)
     model.zero_grad()
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST 13: Full model forward + backward (hybrid attn+conv)
@@ -310,8 +319,8 @@ def test_full_model_hybrid():
     loss_fn = METALoss(1.0, 0.5, 0.5)
     total, ld = loss_fn(pred, batch)
     total.backward()
-    grads_ok = all(p.grad is not None for p in model.parameters() if p.requires_grad)
-    report("Full model (attn,conv,conv)", grads_ok, f"loss={ld['total']:.4f}", time.time()-t0)
+    grads_ok, no_grad = _check_grads(model)
+    report("Full model (attn,conv,conv)", grads_ok, f"loss={ld['total']:.4f}" + (f", missing={no_grad[:3]}" if not grads_ok else ""), time.time()-t0)
     model.zero_grad()
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST 14: Full model with AR + pointer + all masking
@@ -491,12 +500,9 @@ def test_gradient_flow():
     loss_fn = METALoss(1.0, 0.5, 0.5, 0.3, 0.2)
     total, ld = loss_fn(pred, batch, use_ar=True)
     total.backward()
-    no_grad = []
-    for name, p in model.named_parameters():
-        if p.requires_grad and p.grad is None: no_grad.append(name)
-    ok = len(no_grad) == 0
-    detail = f"all {sum(1 for p in model.parameters() if p.requires_grad)} params OK" if ok else f"missing: {no_grad[:5]}"
-    report("E2E gradient flow", ok, detail, time.time()-t0)
+    grads_ok, no_grad = _check_grads(model, skip_unused_heads=False)
+    detail = f"all {sum(1 for p in model.parameters() if p.requires_grad)} params OK" if grads_ok else f"missing: {no_grad[:5]}"
+    report("E2E gradient flow", grads_ok, detail, time.time()-t0)
     model.zero_grad()
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST 24: Batch size > 1 with AR + pointer — per-protein isolation

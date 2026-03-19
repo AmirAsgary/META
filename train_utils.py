@@ -97,9 +97,11 @@ def compute_all_metrics(pred, batch, use_ar=False):
             recon_mse = sum(F.mse_loss(p, t).item()*p.shape[0] for p, t in zip(pred['recon_preds'], pred['recon_targets']) if p.shape[0]>0) / total_masked
             m['recon_mse'] = recon_mse
     if 'topo_nbr_logits' in pred:
-        all_l = torch.cat([l for l in pred['topo_nbr_logits'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_logits',[]) if l.shape[0]>0])
-        all_t = torch.cat([l for l in pred['topo_nbr_labels'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_labels',[]) if l.shape[0]>0])
-        if all_l.shape[0] > 0: m['topo_acc'] = ((all_l > 0).float() == all_t).float().mean().item()
+        parts_l = [l for l in pred['topo_nbr_logits'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_logits',[]) if l.shape[0]>0]
+        parts_t = [l for l in pred['topo_nbr_labels'] if l.shape[0]>0] + [l for l in pred.get('topo_inc_labels',[]) if l.shape[0]>0]
+        if parts_l:
+            all_l = torch.cat(parts_l); all_t = torch.cat(parts_t)
+            m['topo_acc'] = ((all_l > 0).float() == all_t).float().mean().item()
     return m
 # ── Checkpointing ──
 def save_checkpoint(model, optimizer, scheduler, epoch, step, metrics, path, scaler=None):

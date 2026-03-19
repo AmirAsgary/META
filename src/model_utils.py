@@ -181,13 +181,18 @@ class PointerNetwork(nn.Module):
         while pos < N:
             cs = min(chunk_size, N - pos)
             proj_d = self.W2(d_t)
-            scores = self.v(self.dropout(torch.tanh(proj_e + proj_d.unsqueeze(0)))).squeeze(-1)
-            scores[selected] = -1e9
+            raw_scores = self.v(self.dropout(torch.tanh(proj_e + proj_d.unsqueeze(0)))).squeeze(-1)
+            # out-of-place masking: create penalty outside autograd graph
+            with torch.no_grad():
+                mask_inf = torch.zeros(N, device=dev, dtype=raw_scores.dtype)
+                mask_inf[selected] = -1e9
+            scores = raw_scores + mask_inf  # out-of-place add, grad flows through raw_scores only
             probs = F.softmax(scores, dim=0)
             if cs == 1:
                 idx = torch.multinomial(probs, 1).squeeze()
                 perm[pos] = idx; log_probs.append(torch.log(probs[idx] + 1e-12))
-                selected[idx] = True; d_t = self.gru(embeddings[idx].unsqueeze(0), d_t.unsqueeze(0)).squeeze(0)
+                selected[idx] = True  # bookkeeping only, not in graph
+                d_t = self.gru(embeddings[idx].unsqueeze(0), d_t.unsqueeze(0)).squeeze(0)
                 pos += 1
             else:
                 k = min(cs, (~selected).sum().item())
@@ -239,17 +244,20 @@ class ARDecoder(nn.Module):
             dim_feedforward=4*dm, dropout=dropout, batch_first=True, norm_first=True)
         self.transformer_dec = nn.TransformerDecoder(dec_layer, num_layers=2)
         self.head = nn.Linear(dm, n_aa)
-    def _make_causal_mask(self, perm, N, device, node_batch=None):
+    def _make_causal_mask(self, perm, N, device, dtype, node_batch=None):
         """Build causal mask: position perm[t] can only see perm[s] for s < t.
-        If node_batch is provided, also blocks cross-protein attention."""
+        Returns additive float mask: 0 = attend, -inf = block.
+        If node_batch provided, also blocks cross-protein attention."""
         order = torch.zeros(N, dtype=torch.long, device=device)
-        order[perm] = torch.arange(N, device=device)  # order[i] = when position i is decoded
-        mask = order.unsqueeze(0) >= order.unsqueeze(1)  # (N, N): True = block
-        # block cross-protein attention in batched mode
+        order[perm] = torch.arange(N, device=device)  # order[i] = step when position i is decoded
+        # mask[i,j] blocks j from i's view when j decoded at or after i
+        bool_mask = order.unsqueeze(0) >= order.unsqueeze(1)  # (N, N) — True = order[j] >= order[i]
         if node_batch is not None:
-            cross_protein = node_batch.unsqueeze(0) != node_batch.unsqueeze(1)  # (N, N)
-            mask = mask | cross_protein
-        return mask  # True = cannot attend
+            bool_mask = bool_mask | (node_batch.unsqueeze(0) != node_batch.unsqueeze(1))
+        # convert to additive float mask (0=attend, -inf=block) — portable across PyTorch versions
+        float_mask = torch.zeros(N, N, device=device, dtype=dtype)
+        float_mask.masked_fill_(bool_mask, float('-inf'))
+        return float_mask
     def forward(self, h0, msf_bins, bend_ctx, torsion_ctx, seq_gt, perm, node_batch=None):
         """Teacher-forced AR training. h0: (N, dm), seq_gt: (N,), perm: (N,).
         node_batch: (N,) protein assignment per residue — blocks cross-protein attention."""
@@ -260,7 +268,7 @@ class ARDecoder(nn.Module):
         # under teacher forcing, all positions get their GT embedding; causal mask ensures only past is visible
         h_with_aa = cond + self.aa_emb(seq_gt.clamp(0, self.n_aa - 1))  # (N, dm)
         # make causal attention mask from decoding order
-        causal_mask = self._make_causal_mask(perm, N, dev, node_batch)  # (N, N)
+        causal_mask = self._make_causal_mask(perm, N, dev, cond.dtype, node_batch)  # (N, N) float additive
         # query = conditioning at each position; memory = updated node states
         query = cond.unsqueeze(0)  # (1, N, dm) — batch dim
         memory = h_with_aa.unsqueeze(0)  # (1, N, dm)
@@ -269,27 +277,26 @@ class ARDecoder(nn.Module):
     @torch.no_grad()
     def generate(self, h0, msf_bins, bend_ctx, torsion_ctx, perm, temp=1.0, top_p=0.9):
         """True autoregressive generation — decode one position at a time."""
-        N, dm, dev = h0.shape[0], self.dm, h0.device
+        N, dm, dev = h0.shape[0], self.dm, h0.device; dt = h0.dtype
         cond = self.cond_proj(torch.cat([h0, self.msf_emb(msf_bins), bend_ctx, torsion_ctx], -1))
-        seq = torch.full((N,), self.n_aa, device=dev, dtype=torch.long)  # init with mask token
+        seq = torch.full((N,), self.n_aa, device=dev, dtype=torch.long)
         log_probs = torch.zeros(N, device=dev)
         for t in range(N):
             i = perm[t]
-            # build memory with decoded AA embeddings so far
             aa_emb = self.aa_emb(seq.clamp(0, self.n_aa - 1))
-            h_mem = cond + aa_emb  # only positions with actual AA get meaningful embeddings
-            # create mask: position i can see perm[0..t-1]
+            h_mem = cond + aa_emb
+            # float additive mask: 0=attend, -inf=block
             visible = torch.zeros(N, dtype=torch.bool, device=dev)
             if t > 0: visible[perm[:t]] = True
-            attn_mask = ~visible.unsqueeze(0).expand(N, N)  # (N, N) True=block
+            attn_mask = torch.zeros(N, N, device=dev, dtype=dt)
+            attn_mask.masked_fill_(~visible.unsqueeze(0).expand(N, N), float('-inf'))
             query = cond.unsqueeze(0); memory = h_mem.unsqueeze(0)
             decoded = self.transformer_dec(query, memory, tgt_mask=attn_mask, memory_mask=attn_mask)
-            logits = self.head(decoded.squeeze(0)[i]) / temp  # logits for position i
+            logits = self.head(decoded.squeeze(0)[i]) / temp
             probs = F.softmax(logits, -1)
-            # nucleus sampling
             sp, si = probs.sort(descending=True)
-            cumsum = sp.cumsum(-1) - sp; mask_p = cumsum > top_p
-            sp[mask_p] = 0; sp = sp / (sp.sum() + 1e-12)
+            cumsum = sp.cumsum(-1) - sp; mk = cumsum > top_p
+            sp[mk] = 0; sp = sp / (sp.sum() + 1e-12)
             chosen = si[torch.multinomial(sp, 1).squeeze()]
             seq[i] = chosen; log_probs[i] = torch.log(probs[chosen] + 1e-12)
         return seq, log_probs
