@@ -1,0 +1,29 @@
+# META environment
+# Install:  mamba env create -f environment.yml
+# Activate: mamba activate meta
+#
+# PyTorch is installed via pip because only pip reliably gets
+# the correct CUDA build. The --extra-index-url below is for
+# CUDA 12.1. Change to match your driver:
+#   CUDA 12.6: https://download.pytorch.org/whl/cu126
+#   CUDA 12.4: https://download.pytorch.org/whl/cu124
+#   CUDA 12.1: https://download.pytorch.org/whl/cu121
+#   CUDA 11.8: https://download.pytorch.org/whl/cu118
+#   CPU only:  https://download.pytorch.org/whl/cpu
+#
+# Check your CUDA version: nvidia-smi | head -3
+name: meta
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - scipy>=1.10
+  - lmdb>=1.4
+  - prody>=2.4
+  - biopython>=1.83
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    - torch>=2.2
