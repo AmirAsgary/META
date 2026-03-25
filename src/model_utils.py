@@ -331,7 +331,7 @@ class SparseARDecoder(nn.Module):
         for t in range(N):
             i = perm[t]
             # progressive causal mask: positions decoded up to step t are visible
-            decoded_mask = (order[edge_src] <= t).float().unsqueeze(-1)
+            #decoded_mask = (order[edge_src] <= t).float().unsqueeze(-1)
             # note: <= t means src decoded at step 0..t are visible to current position
             # but current position i has order[i]=t, so self-edges (if any) see order[src]<t only
             # actually we want strict < for the target: src decoded BEFORE target
@@ -388,7 +388,7 @@ class METAModel(nn.Module):
         self.pair_var_decoder = PairwiseVarDecoder(d_model, max(32, d_model//2))
         # AR decoder + pointer
         if use_ar:
-            self.ar_decoder = SparseARDecoder(d_model, n_msf_bins=n_msf_bins, n_layers=max(2, n_heads), dropout=dropout, scale=30)
+            self.ar_decoder = SparseARDecoder(d_model, n_msf_bins=n_msf_bins, n_layers=2, dropout=dropout, scale=30)
             if use_pointer: self.pointer_net = PointerNetwork(d_model, dropout)
         # reconstruction decoders
         self.recon_heads = nn.ModuleList([FeatureReconHead(d_model, d) for d in self.d_feats])

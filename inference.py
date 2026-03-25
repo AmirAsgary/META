@@ -135,7 +135,8 @@ def generate_sequences(model, batch, n_designs=100, temperature=0.1, top_p=0.9,
             else:
                 perm = torch.randperm(N, device=device)
             seq, log_probs = model.ar_decoder.generate(
-                h0_enc, msf_bins, bend_ctx, torsion_ctx, perm, temp=temperature, top_p=top_p)
+                h0_enc, h[1], batch['edge_src'], batch['edge_dst'],
+                msf_bins, bend_ctx, torsion_ctx, perm, temp=temperature, top_p=top_p)
             total_log_prob = log_probs.sum().item()
             seq_str = ''.join(IDX_TO_AA[i] for i in seq.cpu().numpy() if i < 20)
         else:
