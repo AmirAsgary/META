@@ -134,18 +134,17 @@ def main():
         # FIX #3: dynamic chunk size from curriculum
         chunk_now = curriculum.get_chunk_size(epoch, args.max_len)
         if hasattr(model, 'chunk_size'): model.chunk_size = chunk_now
-        sched_ratio = curriculum.get_sched_sample_ratio(epoch)  # FIX #1: scheduled sampling
         ep_losses = []; t0 = time.time()
         for si, batch in enumerate(train_dl):
             batch = to_device(batch, device); optimizer.zero_grad(set_to_none=True)
             if args.mixed_precision and device.type == 'cuda':
                 with torch.amp.autocast('cuda'):
-                    pred = model(batch, sched_ratio); loss, ld = loss_fn(pred, batch, use_ar_now)
+                    pred = model(batch); loss, ld = loss_fn(pred, batch, use_ar_now)
                 scaler.scale(loss).backward(); scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer); scaler.update()
             else:
-                pred = model(batch, sched_ratio); loss, ld = loss_fn(pred, batch, use_ar_now)
+                pred = model(batch); loss, ld = loss_fn(pred, batch, use_ar_now)
                 loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip); optimizer.step()
             scheduler.step(); global_step += 1; ep_losses.append(ld)
             if global_step % args.log_every == 0:

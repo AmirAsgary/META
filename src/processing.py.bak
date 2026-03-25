@@ -145,7 +145,7 @@ def build_cochain_complex(backbone: Dict, edge_cutoff: float = 8.0) -> Dict:
     # edge features: dist_rbf(16) + local_dir(3) + seq_sep(16) + covalent(2) = 37
     cb_d = np.linalg.norm(CB[edst] - CB[esrc], axis=-1)
     dist_rbf = rbf_encode(_t.tensor(cb_d, dtype=_t.float32), 0, 20, 16).numpy()
-    dir_raw = CB[edst] - CB[esrc]  # FIX #7: use CB (not CA) to match paper edge definition
+    dir_raw = CA[edst] - CA[esrc]
     dir_n = dir_raw / (np.linalg.norm(dir_raw, axis=-1, keepdims=True) + 1e-8)
     frames = compute_local_frame(N, CA, C)
     loc_dir = project_to_local_frame(dir_n, frames, esrc)

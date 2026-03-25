@@ -228,130 +228,78 @@ class PairwiseVarDecoder(nn.Module):
         self.pe = nn.Linear(dm,dp,bias=False); self.mlp = nn.Sequential(nn.Linear(dp,dp//2),nn.GELU(),nn.Linear(dp//2,1))
     def forward(self, h0, h1, es, ed): return F.relu(self.mlp(self.Wa(h0[es])*self.Wb(h0[ed])+self.pe(h1))).squeeze(-1)
 # ══════════════════════════════════════════════════════════════════════════════
-# Sparse AR Decoder Layer (ProteinMPNN DecLayer pattern)
+# FIX #1: Proper AR Decoder with 2-layer TransformerDecoder + causal masking
 # ══════════════════════════════════════════════════════════════════════════════
-class SparseARDecoderLayer(nn.Module):
-    """Single decoder layer: 3-layer MLP over [target, edge, neighbor] messages,
-    scatter-add aggregation, residual + LN + FFN. Matches ProteinMPNN DecLayer."""
-    def __init__(self, dm, dropout=0.1, scale=30):
-        super().__init__(); self.scale = scale
-        # MLP: 4*dm -> dm -> dm -> dm (input = [h_V_target, h_E, h_S_nbr, h_V_nbr])
-        self.W1 = nn.Linear(dm * 4, dm, bias=True)
-        self.W2 = nn.Linear(dm, dm, bias=True)
-        self.W3 = nn.Linear(dm, dm, bias=True)
-        self.act = nn.GELU()
-        self.norm1 = nn.LayerNorm(dm); self.norm2 = nn.LayerNorm(dm)
-        self.dropout1 = nn.Dropout(dropout); self.dropout2 = nn.Dropout(dropout)
-        self.dense = nn.Sequential(nn.Linear(dm, dm * 4), nn.GELU(), nn.Dropout(dropout), nn.Linear(dm * 4, dm))
-    def forward(self, h_V, h_ESV_mixed, edge_dst, N):
-        """h_V: (N,dm) node states, h_ESV_mixed: (E,3*dm) causal messages, edge_dst: (E,) targets."""
-        h_target = h_V[edge_dst]  # (E, dm)
-        h_msg_in = torch.cat([h_target, h_ESV_mixed], -1)  # (E, 4*dm)
-        h_msg = self.W3(self.act(self.W2(self.act(self.W1(h_msg_in)))))  # (E, dm)
-        # scatter-add to destination nodes, fixed normalization (like ProteinMPNN /scale)
-        dh = torch.zeros(N, h_msg.shape[-1], device=h_msg.device, dtype=h_msg.dtype)
-        dh.scatter_add_(0, edge_dst.unsqueeze(-1).expand_as(h_msg), h_msg)
-        dh = dh / self.scale
-        h_V = self.norm1(h_V + self.dropout1(dh))
-        h_V = self.norm2(h_V + self.dropout2(self.dense(h_V)))
-        return h_V
-# Full Sparse AR Decoder
-class SparseARDecoder(nn.Module):
-    """ProteinMPNN-style AR decoder: sparse graph causal message masking.
-    Per-edge binary mask splits neighbors into 'past' (seq+structure) and
-    'future' (structure-only). Parallel training, sequential generation.
-    Conditioned on predicted MSF, bend context, torsion context."""
-    def __init__(self, dm, n_aa=20, n_msf_bins=32, n_layers=2, dropout=0.1, scale=30):
+class ARDecoder(nn.Module):
+    """AR decoder per proposal: 2-layer TransformerDecoder with causal masking,
+    conditioned on MSF, bend context, torsion context. Teacher forcing during training."""
+    def __init__(self, dm, n_aa=20, n_msf_bins=32, n_heads=4, dropout=0.1):
         super().__init__(); self.dm = dm; self.n_aa = n_aa
         self.aa_emb = nn.Embedding(n_aa + 1, dm)  # +1 for mask/unknown token
         self.msf_emb = nn.Embedding(n_msf_bins, dm // 4)
-        self.cond_proj = nn.Linear(dm + dm // 4 + dm + dm, dm)  # h0 || msf || bend || torsion
-        self.decoder_layers = nn.ModuleList([SparseARDecoderLayer(dm, dropout, scale) for _ in range(n_layers)])
+        # conditioning projection: h0 + msf_emb + bend_ctx + torsion_ctx -> dm
+        self.cond_proj = nn.Linear(dm + dm//4 + dm + dm, dm)
+        # 2-layer TransformerDecoder (proposal: "lightweight 2-layer Transformer decoder")
+        dec_layer = nn.TransformerDecoderLayer(d_model=dm, nhead=max(1, min(n_heads, dm)),
+            dim_feedforward=4*dm, dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer_dec = nn.TransformerDecoder(dec_layer, num_layers=2)
         self.head = nn.Linear(dm, n_aa)
-        # xavier init
-        for p in self.parameters():
-            if p.dim() > 1: nn.init.xavier_uniform_(p)
-    def _build_causal_mask(self, perm, edge_src, edge_dst, node_batch=None):
-        """Per-edge binary causal mask: 1 if neighbor (src) decoded before target (dst).
-        Returns (E, 1) float tensor. Cross-protein edges blocked if node_batch given."""
-        N = perm.shape[0]; dev = perm.device
-        order = torch.zeros(N, dtype=torch.long, device=dev)
-        order[perm] = torch.arange(N, device=dev)
-        mask_bw = (order[edge_src] < order[edge_dst]).float().unsqueeze(-1)  # (E, 1)
+    def _make_causal_mask(self, perm, N, device, dtype, node_batch=None):
+        """Build causal mask: position perm[t] can only see perm[s] for s < t.
+        Returns additive float mask: 0 = attend, -inf = block.
+        If node_batch provided, also blocks cross-protein attention."""
+        order = torch.zeros(N, dtype=torch.long, device=device)
+        order[perm] = torch.arange(N, device=device)  # order[i] = step when position i is decoded
+        # mask[i,j] blocks j from i's view when j decoded at or after i
+        bool_mask = order.unsqueeze(0) >= order.unsqueeze(1)  # (N, N) — True = order[j] >= order[i]
         if node_batch is not None:
-            same = (node_batch[edge_src] == node_batch[edge_dst]).float().unsqueeze(-1)
-            mask_bw = mask_bw * same
-        return mask_bw
-    def _build_messages(self, h_V, h_V_enc, h_E_enc, h_S, edge_src, mask_bw):
-        """Build per-edge mixed messages. Past: [edge, seq_nbr, node_nbr(updated)].
-        Future: [edge, zeros, node_nbr(frozen encoder)]. Returns (E, 3*dm)."""
-        mask_fw = 1.0 - mask_bw
-        h_past = torch.cat([h_E_enc, h_S[edge_src], h_V[edge_src]], -1)
-        h_future = torch.cat([h_E_enc, torch.zeros_like(h_S[edge_src]), h_V_enc[edge_src]], -1)
-        return mask_bw * h_past + mask_fw * h_future
-    def _decode_pass(self, cond, h_V_enc, h_E_enc, h_S, edge_src, edge_dst, mask_bw, N):
-        """Single decoder forward pass: init from cond, aggregate causal messages."""
-        h_V = cond.clone()
-        for layer in self.decoder_layers:
-            h_ESV = self._build_messages(h_V, h_V_enc, h_E_enc, h_S, edge_src, mask_bw)
-            h_V = layer(h_V, h_ESV, edge_dst, N)
-        return self.head(h_V)
-    def forward(self, h_V_enc, h_E_enc, edge_src, edge_dst, msf_bins, bend_ctx, torsion_ctx,
-                seq_gt, perm, node_batch=None, sched_sample_ratio=0.0):
-        """Parallel teacher-forced AR decoding with graph-sparse causal masking.
-        h_V_enc: (N,dm) encoder node latents, h_E_enc: (E,dm) encoder edge latents,
-        edge_src/dst: (E,) contact graph edges, seq_gt: (N,) GT AA indices,
-        perm: (N,) decoding permutation, sched_sample_ratio: fraction for scheduled sampling."""
-        N, dev = h_V_enc.shape[0], h_V_enc.device
-        cond = self.cond_proj(torch.cat([h_V_enc, self.msf_emb(msf_bins), bend_ctx, torsion_ctx], -1))
-        mask_bw = self._build_causal_mask(perm, edge_src, edge_dst, node_batch)
-        # scheduled sampling (Phase 4): two-pass — first pass gets causal predictions,
-        # then 20% of GT tokens are replaced with model predictions, second pass computes loss
-        if sched_sample_ratio > 0 and self.training:
-            with torch.no_grad():
-                h_S_gt = self.aa_emb(seq_gt.clamp(0, self.n_aa - 1))
-                pred_logits = self._decode_pass(cond, h_V_enc, h_E_enc, h_S_gt, edge_src, edge_dst, mask_bw, N)
-                pred_aa = pred_logits.argmax(-1)
-            ss_mask = torch.rand(N, device=dev) < sched_sample_ratio
-            seq_input = torch.where(ss_mask, pred_aa.clamp(0, self.n_aa - 1), seq_gt.clamp(0, self.n_aa - 1))
-        else:
-            seq_input = seq_gt.clamp(0, self.n_aa - 1)
-        h_S = self.aa_emb(seq_input)
-        return self._decode_pass(cond, h_V_enc, h_E_enc, h_S, edge_src, edge_dst, mask_bw, N)
+            bool_mask = bool_mask | (node_batch.unsqueeze(0) != node_batch.unsqueeze(1))
+        # convert to additive float mask (0=attend, -inf=block) — portable across PyTorch versions
+        float_mask = torch.zeros(N, N, device=device, dtype=dtype)
+        float_mask.masked_fill_(bool_mask, float('-inf'))
+        return float_mask
+    def forward(self, h0, msf_bins, bend_ctx, torsion_ctx, seq_gt, perm, node_batch=None):
+        """Teacher-forced AR training. h0: (N, dm), seq_gt: (N,), perm: (N,).
+        node_batch: (N,) protein assignment per residue — blocks cross-protein attention."""
+        N, dm, dev = h0.shape[0], self.dm, h0.device
+        # build conditioning vector per proposal eq
+        cond = self.cond_proj(torch.cat([h0, self.msf_emb(msf_bins), bend_ctx, torsion_ctx], -1))  # (N, dm)
+        # inject previously decoded AA embeddings into node states (proposal eq: h_hat = h + e(a) for decoded)
+        # under teacher forcing, all positions get their GT embedding; causal mask ensures only past is visible
+        h_with_aa = cond + self.aa_emb(seq_gt.clamp(0, self.n_aa - 1))  # (N, dm)
+        # make causal attention mask from decoding order
+        causal_mask = self._make_causal_mask(perm, N, dev, cond.dtype, node_batch)  # (N, N) float additive
+        # query = conditioning at each position; memory = updated node states
+        query = cond.unsqueeze(0)  # (1, N, dm) — batch dim
+        memory = h_with_aa.unsqueeze(0)  # (1, N, dm)
+        decoded = self.transformer_dec(query, memory, tgt_mask=causal_mask, memory_mask=causal_mask)
+        return self.head(decoded.squeeze(0))  # (N, n_aa)
     @torch.no_grad()
-    def generate(self, h_V_enc, h_E_enc, edge_src, edge_dst, msf_bins, bend_ctx, torsion_ctx,
-                 perm, temp=1.0, top_p=0.9):
-        """True autoregressive generation: decode one position at a time."""
-        N, dev = h_V_enc.shape[0], h_V_enc.device
-        cond = self.cond_proj(torch.cat([h_V_enc, self.msf_emb(msf_bins), bend_ctx, torsion_ctx], -1))
-        S = torch.full((N,), self.n_aa, dtype=torch.long, device=dev)
+    def generate(self, h0, msf_bins, bend_ctx, torsion_ctx, perm, temp=1.0, top_p=0.9):
+        """True autoregressive generation — decode one position at a time."""
+        N, dm, dev = h0.shape[0], self.dm, h0.device; dt = h0.dtype
+        cond = self.cond_proj(torch.cat([h0, self.msf_emb(msf_bins), bend_ctx, torsion_ctx], -1))
+        seq = torch.full((N,), self.n_aa, device=dev, dtype=torch.long)
         log_probs = torch.zeros(N, device=dev)
-        order = torch.zeros(N, dtype=torch.long, device=dev)
-        order[perm] = torch.arange(N, device=dev)
         for t in range(N):
             i = perm[t]
-            # progressive causal mask: positions decoded up to step t are visible
-            decoded_mask = (order[edge_src] <= t).float().unsqueeze(-1)
-            # note: <= t means src decoded at step 0..t are visible to current position
-            # but current position i has order[i]=t, so self-edges (if any) see order[src]<t only
-            # actually we want strict < for the target: src decoded BEFORE target
-            # at step t, target is perm[t], order[perm[t]]=t
-            # a src is "past" if order[src] < order[target] = t, so decoded_mask = (order[src] < t)
-            decoded_mask = (order[edge_src] < t).float().unsqueeze(-1)
-            h_S = self.aa_emb(S.clamp(0, self.n_aa - 1))
-            h_V = cond.clone()
-            for layer in self.decoder_layers:
-                h_ESV = self._build_messages(h_V, h_V_enc, h_E_enc, h_S, edge_src, decoded_mask)
-                h_V = layer(h_V, h_ESV, edge_dst, N)
-            logits_i = self.head(h_V)[i] / temp
-            probs = F.softmax(logits_i, -1)
-            # nucleus (top-p) sampling
+            aa_emb = self.aa_emb(seq.clamp(0, self.n_aa - 1))
+            h_mem = cond + aa_emb
+            # float additive mask: 0=attend, -inf=block
+            visible = torch.zeros(N, dtype=torch.bool, device=dev)
+            if t > 0: visible[perm[:t]] = True
+            attn_mask = torch.zeros(N, N, device=dev, dtype=dt)
+            attn_mask.masked_fill_(~visible.unsqueeze(0).expand(N, N), float('-inf'))
+            query = cond.unsqueeze(0); memory = h_mem.unsqueeze(0)
+            decoded = self.transformer_dec(query, memory, tgt_mask=attn_mask, memory_mask=attn_mask)
+            logits = self.head(decoded.squeeze(0)[i]) / temp
+            probs = F.softmax(logits, -1)
             sp, si = probs.sort(descending=True)
             cumsum = sp.cumsum(-1) - sp; mk = cumsum > top_p
             sp[mk] = 0; sp = sp / (sp.sum() + 1e-12)
             chosen = si[torch.multinomial(sp, 1).squeeze()]
-            S[i] = chosen; log_probs[i] = torch.log(probs[chosen] + 1e-12)
-        return S, log_probs
+            seq[i] = chosen; log_probs[i] = torch.log(probs[chosen] + 1e-12)
+        return seq, log_probs
 # ══════════════════════════════════════════════════════════════════════════════
 # parse_layer_types
 # ══════════════════════════════════════════════════════════════════════════════
@@ -388,7 +336,7 @@ class METAModel(nn.Module):
         self.pair_var_decoder = PairwiseVarDecoder(d_model, max(32, d_model//2))
         # AR decoder + pointer
         if use_ar:
-            self.ar_decoder = SparseARDecoder(d_model, n_msf_bins=n_msf_bins, n_layers=max(2, n_heads), dropout=dropout, scale=30)
+            self.ar_decoder = ARDecoder(d_model, n_msf_bins=n_msf_bins, n_heads=max(1, n_heads), dropout=dropout)
             if use_pointer: self.pointer_net = PointerNetwork(d_model, dropout)
         # reconstruction decoders
         self.recon_heads = nn.ModuleList([FeatureReconHead(d_model, d) for d in self.d_feats])
@@ -454,7 +402,7 @@ class METAModel(nn.Module):
             perm[offset:offset + n_b] = torch.where(mask_b)[0][torch.randperm(n_b, device=device)]
             offset += n_b
         return perm
-    def forward(self, batch, sched_sample_ratio=0.0):
+    def forward(self, batch):
         dev = batch['node_feat'].device
         orig_feats = [batch['node_feat'], batch['edge_feat'], batch['bend_feat'], batch['torsion_feat']]
         orig_topo = self._build_topo(batch)
@@ -464,11 +412,7 @@ class METAModel(nn.Module):
         h = self.encode(masked_feats, masked_topo)
         out = {}
         # primary predictions
-        # FIX #6: skip one-shot seq_decoder when AR active during training (save compute)
-        if self.use_ar and hasattr(self, 'ar_decoder') and self.training:
-            out['seq_logits'] = torch.zeros(h[0].shape[0], 20, device=dev)
-        else:
-            out['seq_logits'] = self.seq_decoder(h[0])
+        out['seq_logits'] = self.seq_decoder(h[0])
         out['biochem_pred'] = self.biochem_decoder(h[2]) if h[2].shape[0] > 0 else torch.zeros(0, 4, device=dev)
         out['torsion_biochem_pred'] = self.torsion_biochem_decoder(h[3]) if h[3].shape[0] > 0 else torch.zeros(0, 4, device=dev)
         out['msf_pred'] = self.msf_decoder(h[0])
@@ -494,7 +438,7 @@ class METAModel(nn.Module):
                 out['perm'] = perm
             # FIX #1: proper AR with TransformerDecoder + teacher forcing
             # FIX BUG2: pass node_batch to block cross-protein attention
-            out['ar_logits'] = self.ar_decoder(h[0], h[1], batch['edge_src'], batch['edge_dst'], msf_bins, bend_ctx, torsion_ctx, batch['seq_idx'], perm, nb, sched_sample_ratio)
+            out['ar_logits'] = self.ar_decoder(h[0], msf_bins, bend_ctx, torsion_ctx, batch['seq_idx'], perm, nb)
         # feature reconstruction
         out['recon_preds'] = []; out['recon_targets'] = []; out['recon_masks'] = masks
         for r in range(4):
